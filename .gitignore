@@ -1,0 +1,18 @@
+# Runtime data / database
+crawler.db
+crawler.db-shm
+crawler.db-wal
+
+# Downloaded documents (huge, machine-specific)
+downloads/
+
+sandeep
+
+# Per-site configs (local absolute paths, excluded per request)
+sites/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
