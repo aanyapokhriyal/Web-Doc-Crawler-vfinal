@@ -102,7 +102,7 @@ BREAKERS_LOG_COLUMNS = [
 MASTER_ROLLUP_COLUMNS = [
     "Site", "Pages Crawled (last run)", "Total Files Known",
     "PDF", "DOC", "DOCX", "XLS", "XLSX", "CSV", "Other File Types",
-    "Downloaded", "Failed", "Pending", "Last Run At",
+    "Downloaded", "Failed", "Pending", "First Run At", "Last Run At",
 ]
 
 
@@ -138,7 +138,14 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_type: 
     without anyone having to delete and rebuild it."""
     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        except sqlite3.OperationalError as e:
+            # Benign race: another site thread's init_db() already added this
+            # column between our PRAGMA check and this ALTER TABLE — nothing
+            # left to do. Anything else is a real error and must still raise.
+            if "duplicate column name" not in str(e):
+                raise
 
 
 def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -499,6 +506,13 @@ def get_latest_run(conn: sqlite3.Connection, site_tag: str) -> dict | None:
     return dict(row) if row else None
 
 
+def get_first_run(conn: sqlite3.Connection, site_tag: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM runs WHERE site_tag = ? ORDER BY id ASC LIMIT 1", (site_tag,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
 # ---------------------------------------------------------------------------
 # Breakers log (live, append-only in effect)
 # ---------------------------------------------------------------------------
@@ -638,7 +652,10 @@ def export_site_workbook(conn: sqlite3.Connection, site_tag: str,
         for url, status in change_log:
             change_sheet.append(_sanitize_row([ts, url, status]))
 
-    wb.save(output_path)
+    try:
+        wb.save(output_path)
+    except Exception as e:
+        print(f"  [warning] could not save {output_path} — is it open in another program? ({e})")
     return output_path
 
 
@@ -659,6 +676,14 @@ DEFAULT_MASTER_SUMMARY_PATH = "_MASTER_REPORTS/MASTER_SUMMARY.xlsx"
 # shares this same process (were sites ever split across separate
 # processes, this would need a cross-process file lock instead).
 _master_summary_lock = threading.Lock()
+
+# Same hazard, same fix, for BREAKERS_LOG.xlsx: every site's thread calls
+# export_breakers_log() against the same fixed shared path, and without a
+# lock two threads' concurrent wb.save() calls to that one path can
+# interleave and corrupt the file (confirmed real incident). A separate
+# lock from _master_summary_lock so writing one file never blocks on the
+# other.
+_breakers_log_lock = threading.Lock()
 
 
 def _acquire_cross_process_lock(lock_path: Path, timeout: float = 60.0, poll_interval: float = 0.1) -> None:
@@ -692,6 +717,7 @@ def _release_cross_process_lock(lock_path: Path) -> None:
 
 def _compute_master_row(conn: sqlite3.Connection, site_tag: str) -> list:
     latest_run = get_latest_run(conn, site_tag)
+    first_run = get_first_run(conn, site_tag)
     type_counts = get_document_type_counts(conn, site_tag)
     total = sum(type_counts.values())
     named_types = {"pdf", "doc", "docx", "xls", "xlsx", "csv"}
@@ -713,6 +739,7 @@ def _compute_master_row(conn: sqlite3.Connection, site_tag: str) -> list:
         type_counts.get("xlsx", 0), type_counts.get("csv", 0),
         other_types,
         downloaded, failed, pending,
+        first_run["started_at"] if first_run else "",
         latest_run["finished_at"] if latest_run else "",
     ])
 
@@ -733,7 +760,10 @@ def export_master_rollup(conn: sqlite3.Connection, site_tags: list[str],
     for site_tag in site_tags:
         sheet.append(_compute_master_row(conn, site_tag))
 
-    wb.save(output_path)
+    try:
+        wb.save(output_path)
+    except Exception as e:
+        print(f"  [warning] could not save {output_path} — is it open in another program? ({e})")
     return output_path
 
 
@@ -797,7 +827,10 @@ def update_master_summary(conn: sqlite3.Connection, site_tag: str,
             else:
                 sheet.append(new_row)
 
-            wb.save(output_path)
+            try:
+                wb.save(output_path)
+            except Exception as e:
+                print(f"  [warning] could not save {output_path} — is it open in another program? ({e})")
             return output_path
         finally:
             _release_cross_process_lock(lock_path)
@@ -811,20 +844,31 @@ def export_breakers_log(conn: sqlite3.Connection, output_path: str | Path = "BRE
     from openpyxl import Workbook
 
     output_path = Path(output_path)
-    breakers = get_breakers(conn)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = output_path.parent / f".{output_path.name}.lock"
 
-    wb = Workbook()
-    sheet = wb.active
-    sheet.title = "Breakers"
-    sheet.append(BREAKERS_LOG_COLUMNS)
-    sheet.freeze_panes = "A2"
+    with _breakers_log_lock:
+        _acquire_cross_process_lock(lock_path)
+        try:
+            breakers = get_breakers(conn)
 
-    for entry in breakers:
-        sheet.append(_sanitize_row([
-            entry["timestamp"], entry["site_tag"], entry["url"],
-            entry["tier_attempted"], entry["signal"],
-            entry["action_taken"], entry["outcome"],
-        ]))
+            wb = Workbook()
+            sheet = wb.active
+            sheet.title = "Breakers"
+            sheet.append(BREAKERS_LOG_COLUMNS)
+            sheet.freeze_panes = "A2"
 
-    wb.save(output_path)
-    return output_path
+            for entry in breakers:
+                sheet.append(_sanitize_row([
+                    entry["timestamp"], entry["site_tag"], entry["url"],
+                    entry["tier_attempted"], entry["signal"],
+                    entry["action_taken"], entry["outcome"],
+                ]))
+
+            try:
+                wb.save(output_path)
+            except Exception as e:
+                print(f"  [warning] could not save {output_path} — is it open in another program? ({e})")
+            return output_path
+        finally:
+            _release_cross_process_lock(lock_path)

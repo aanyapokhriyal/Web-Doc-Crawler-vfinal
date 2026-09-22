@@ -7,6 +7,13 @@ crawler.db-wal
 downloads/
 
 sandeep
+sandeep.py
+
+# Generated per-site export workbooks (regenerated from crawler.db anytime)
+_WORKBOOKS/
+
+# Local working notes (session logs, not project deliverables)
+
 
 # Per-site configs (local absolute paths, excluded per request)
 sites/
@@ -16,3 +23,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Claude Code local tool config
+.claude/
+
+# Safety-copy backups made before schema/data migrations
+*.backup-*
