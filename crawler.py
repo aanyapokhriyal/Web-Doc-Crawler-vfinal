@@ -77,6 +77,16 @@ SKIP_EXTENSIONS = {
     ".css", ".js", ".woff", ".woff2", ".ttf", ".eot",
     ".mp4", ".mp3", ".avi", ".mov", ".wmv", ".xml"
 }
+# Path substrings that suggest a URL is a file-serving handler rather than
+# an ordinary page, even though it has a real (non-document) extension
+# like .aspx/.php -- confirmed real case: SSNNL's download.aspx?couchdbdocid=
+# serves real PDFs. Deliberately a short, specific list, not "any extension
+# we don't recognize" -- that broader version was confirmed to also treat
+# every ordinary .php/.aspx navigation page on a traditional government
+# site as worth an individual HEAD request (41 on TGERC's homepage alone),
+# which is wasted cost almost everywhere and meaningfully slows down any
+# site with many such pages.
+DOCUMENT_HANDLER_PATH_KEYWORDS = ("download", "getfile", "viewdoc", "attachment")
 DEFAULT_MAX_DEPTH = 10
 DEFAULT_MIN_YEAR = 1900
 DEFAULT_MAX_TOTAL_PAGES = 10000
@@ -105,6 +115,13 @@ MIN_MEANINGFUL_LINKS_FOR_SEED_PAGE = 1
 LEAF_QUERY_PARAM_THRESHOLD = 2       # multisite's dashboard-explosion guard
 THROTTLE_SECONDS = 1.0
 REQUEST_TIMEOUT = 20
+# Short, no-retry timeout for the speculative HTTP-vs-HTTPS probes in
+# SiteFetcher (_try_better_http_seed / _try_http_downgrade) -- confirmed
+# real case: a closed/filtered plain-HTTP port doesn't always refuse the
+# connection outright, it can just hang, so this must fail fast rather
+# than inheriting REQUEST_TIMEOUT (paid once per site regardless of
+# whether that site ever needed the check).
+HTTP_PROBE_TIMEOUT = 5
 PAGE_TIMEOUT_MS = 45_000
 # Automatic retry ceiling for a document download that times out at the
 # normal 30s (see download_one()) -- confirmed real, recurring case:
@@ -119,6 +136,14 @@ EXTENDED_DOWNLOAD_TIMEOUT = 90
 # isn't a requests.RequestException. Anything past this ceiling is treated
 # as "not real page content" and skipped, the same as a non-HTML response.
 MAX_PAGE_RESPONSE_BYTES = 25_000_000
+# NTFS hard limit on a single path COMPONENT (a filename by itself), separate
+# from and unaffected by the \\?\ long-path prefix used elsewhere in this
+# file (that prefix only lifts the ~32K limit on the TOTAL path length).
+# Confirmed real crash: BERC generates filenames from full document titles
+# with no length cap, and 140 of them exceeded this per-component limit,
+# failing every write with "WinError 123: The filename, directory name, or
+# volume label syntax is incorrect."
+MAX_FILENAME_COMPONENT_LENGTH = 255
 JS_SETTLE_POLL_MS = 300              # adaptive-wait poll interval
 JS_SETTLE_CEILING_MS = 6_000         # never wait longer than multisite did
 DEFAULT_DOWNLOAD_CONCURRENCY = 4     # download phase only, never crawling
@@ -172,6 +197,10 @@ class SiteConfig:
     use_fixed_js_wait: bool = False
     domain_blind_documents: bool = True
     allow_legacy_ssl_renegotiation: bool = False
+    disable_ssl_verification: bool = False
+    session_refresh: dict = field(default_factory=dict)
+    postback_documents: bool = False
+    excluded_domains: list = field(default_factory=list)
 
     @property
     def metadata_dir(self) -> Path:
@@ -221,6 +250,10 @@ def load_site_config(path: Path) -> SiteConfig:
         use_fixed_js_wait=bool(raw.get("use_fixed_js_wait", False)),
         domain_blind_documents=bool(raw.get("domain_blind_documents", True)),
         allow_legacy_ssl_renegotiation=bool(raw.get("allow_legacy_ssl_renegotiation", False)),
+        disable_ssl_verification=bool(raw.get("disable_ssl_verification", False)),
+        session_refresh=dict(raw.get("session_refresh", {})),
+        postback_documents=bool(raw.get("postback_documents", False)),
+        excluded_domains=list(raw.get("excluded_domains", [])),
     )
 
 
@@ -301,9 +334,13 @@ def write_init_config(site_tag: str, base_url: str, output_dir: str, extra_seeds
             "to false only if this site is known to be at real risk of a "
             "malicious/compromised element (a hijacked ad, a poisoned "
             "iframe) pointing to an unrelated, untrusted domain with a "
-            "document-like extension. This ONLY affects whether a DOCUMENT "
-            "gets recorded; page-following (crawling further) always stays "
-            "restricted to allowed_domains regardless of this setting."
+            "document-like extension. Page-following also automatically "
+            "follows a link into any subdomain of this site's own "
+            "allowed_domains (e.g. report.erldc.in from erldc.in) "
+            "regardless of this setting — only a domain that ISN'T even a "
+            "subdomain of one already configured here needs "
+            "domain_blind_documents=true to have its documents recorded, "
+            "and page-following never extends to it at all."
         ),
     }
     out_path = SITES_DIR / f"{site_tag.lower()}.json"
@@ -339,18 +376,32 @@ def list_all_configs() -> list[Path]:
 # robots.txt
 # ---------------------------------------------------------------------------
 
-def load_robots(base_url: str):
+def load_robots(base_url: str, conn=None, site_tag: str | None = None):
     """Always attempts to load robots.txt, regardless of whether it will
     actually be enforced — SiteConfig.respect_robots controls whether a
     disallowed URL is skipped or just logged and fetched anyway, but
-    either way we need the parsed rules to know which case applies."""
+    either way we need the parsed rules to know which case applies.
+
+    Note: a plain 404 (no robots.txt file at all -- the common case) never
+    reaches the except below; Python's own RobotFileParser.read() already
+    treats a 4xx HTTPError as "allow everything" internally without
+    raising. Only a genuine connectivity failure (DNS, connection refused,
+    timeout, SSL) gets here -- previously silent (not even printed), now
+    logged so a site whose robots.txt is simply unreachable is
+    distinguishable from one that was actually checked and found
+    permissive."""
     parsed = urlparse(base_url)
     rp = robotparser.RobotFileParser()
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     try:
-        rp.set_url(f"{parsed.scheme}://{parsed.netloc}/robots.txt")
+        rp.set_url(robots_url)
         rp.read()
         return rp
-    except Exception:
+    except Exception as e:
+        if conn is not None and site_tag is not None:
+            storage.log_breaker(conn, site_tag, robots_url, "n/a",
+                                 f"robots.txt fetch failed: {e}",
+                                 "treated as allow-all", "n/a")
         return None  # no usable robots.txt -> treat as "allow everything"
 
 
@@ -368,17 +419,110 @@ def is_allowed_by_robots(rp, url: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def normalize_url(url: str) -> str:
-    return urlparse(url)._replace(fragment="").geturl()
+    """Strips the fragment -- except when it looks like a client-side
+    router path (starts with '/', e.g. '#/pages/sm/tender/offices/...')
+    rather than an ordinary same-page anchor (e.g. '#section2'). Angular/
+    Vue-style hash-routed SPAs (confirmed real case: AVVNL, served from
+    energy.rajasthan.gov.in/avvnl) put their entire site behind distinct
+    '#/...' routes off a single real URL -- stripping the fragment made
+    every one of those routes collapse into the same already-visited
+    homepage URL, so the crawler found 153 real links on the rendered
+    page but queued none of them, visited 1 page, and found 0 documents."""
+    parsed = urlparse(url)
+    if parsed.fragment.startswith("/"):
+        return parsed.geturl()
+    return parsed._replace(fragment="").geturl()
 
 
 def is_document_link(url: str, extensions=FILE_EXTENSIONS) -> bool:
     return Path(urlparse(url).path).suffix.lower() in extensions
 
 
+# Only extensions with a reliable, well-known magic-byte signature go here.
+# Deliberately NOT exhaustive -- .doc/.xls/.ppt (older OLE compound-file
+# format), .csv/.txt/.rtf have no signature reliable enough to risk a false
+# rejection of an already-working download, so they're simply never
+# checked (identical to today's behavior: always accepted). Confirmed
+# real, live case this validates against: dgvcl.com's
+# viewpdf.php?...filename=X.pdf "document" actually serves the site's own
+# HTML shell (Content-Type: text/html) instead of the real PDF -- with no
+# check at all, that HTML would be silently saved as X.pdf and marked a
+# successful download.
+_ZIP_BASED_EXTENSIONS = {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".zip"}
+_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+
+
+def is_valid_file_content(content: bytes, extension: str) -> bool:
+    """True if content's actual bytes look like the format `extension`
+    claims -- or if `extension` has no signature reliable enough to check
+    (existing behavior, unchanged, for anything not covered below)."""
+    extension = extension.lower()
+    if extension == ".pdf":
+        return b"%PDF" in content[:1024]
+    if extension in _ZIP_BASED_EXTENSIONS:
+        return content[:4] in _ZIP_SIGNATURES
+    if extension == ".rar":
+        return content[:4] == b"Rar!"
+    return True
+
+
 def should_skip_asset(url: str, skip_extensions=SKIP_EXTENSIONS) -> bool:
     """True for images/CSS/JS/fonts/media — never worth queuing as a page
     to crawl, and never a document to record either."""
     return Path(urlparse(url).path).suffix.lower() in skip_extensions
+
+
+def is_same_base_domain(netloc: str, allowed_domains: list[str]) -> bool:
+    """True if netloc IS one of allowed_domains, or is a subdomain of one --
+    e.g. 'webcdn.grid-india.in' matches allowed_domains=['grid-india.in',
+    'www.grid-india.in'] because it ends with '.grid-india.in'. Confirmed
+    real, currently-active gap: auditing every site config found only 7 of
+    65 had domain_blind_documents=true; the other 50 (many written before
+    that flag's default flipped to true, which only affects brand-new
+    configs) still silently drop every document hosted on exactly this
+    kind of same-site file/CDN subdomain -- GRID-INDIA's webcdn.grid-india.in,
+    ERCKERALA's dev.erckerala.org. Deliberately NOT full public-suffix-list
+    logic (no new dependency) -- derives "same base domain" purely from
+    each site's own already-curated allowed_domains, so an unrelated
+    domain (a hijacked/poisoned link) still does NOT match here; that
+    stays gated behind the separate, explicit domain_blind_documents
+    opt-in below.
+
+    Compares hostname only, ignoring any port -- confirmed real case: HVPN
+    serves its documents from hvpn.org.in:8443 (same host, a document/
+    e-office subsystem on a different port), and urlparse()'s netloc
+    includes the port, so an un-stripped comparison would wrongly treat
+    this as a completely unrelated domain."""
+    netloc = netloc.lower().split(":")[0]
+    for allowed in allowed_domains:
+        core = allowed.lower().split(":")[0].removeprefix("www.")
+        if netloc == core or netloc.endswith("." + core):
+            return True
+    return False
+
+
+def enforce_filename_component_limit(filename: str, max_length: int = MAX_FILENAME_COMPONENT_LENGTH) -> str:
+    """Truncates just the name part (keeping the extension) so the final
+    filename component always fits within max_length -- see
+    MAX_FILENAME_COMPONENT_LENGTH's docstring for why this is a separate
+    concern from the existing total-path-length handling."""
+    if len(filename) <= max_length:
+        return filename
+    name_part, dot, extension = filename.rpartition(".")
+    if not dot:
+        return filename[:max_length]
+    keep = max_length - len(extension) - 1
+    return f"{name_part[:keep]}.{extension}"
+
+
+def enforce_folder_component_limit(folder_path: str, max_length: int = MAX_FILENAME_COMPONENT_LENGTH) -> str:
+    """Same NTFS per-component limit as enforce_filename_component_limit(),
+    applied to EACH segment of a folder path -- confirmed real case: BERC's
+    generated target_folder_path embeds the full (300+ character) document
+    title as one subfolder segment, which crashes mkdir with WinError 123
+    before a download even reaches the filename itself."""
+    segments = folder_path.replace("\\", "/").split("/")
+    return "/".join(seg[:max_length] for seg in segments)
 
 
 def is_leaf_url(url: str, threshold: int = LEAF_QUERY_PARAM_THRESHOLD) -> bool:
@@ -389,8 +533,95 @@ def is_leaf_url(url: str, threshold: int = LEAF_QUERY_PARAM_THRESHOLD) -> bool:
     return len(parse_qs(urlparse(url).query)) >= threshold
 
 
+# Path fragments belonging to well-known utility endpoints that generate a
+# combinatorial explosion of otherwise-meaningless URLs -- confirmed real,
+# currently-active case: PED_SERVICES' electricity.py.gov.in (Drupal) has a
+# "styleswitcher" accessibility theme-toggle on every real page, each one
+# linking back to itself as
+# /styleswitcher/switch/nexus/custom/<theme>?destination=<that page's own
+# path>. LEAF_QUERY_PARAM_THRESHOLD (>= 2 distinct query param NAMES) can't
+# catch this -- it only ever has ONE param ("destination") -- so a real
+# crawl visited 5,200 pages, 65% of them this single non-content utility,
+# and was still nowhere near finished. This module ships with Drupal core
+# and is common across many .gov.in sites, so this is deliberately a path
+# pattern, not a site-specific flag -- fixes PED_SERVICES/electricity.py.gov.in
+# now and any other Drupal site hitting the same trap in the future, with
+# no config needed.
+#
+# Second confirmed case, same shape: PGVCL's www.pgvcl.com/freport/complaint.php
+# is a consumer complaint-tracking page -- every complaint ever filed gets its
+# own URL via a single "bhjid" param with a different (effectively random)
+# value each time. Same reason LEAF_QUERY_PARAM_THRESHOLD can't catch it (one
+# param name, not two), same result: 74,667 of 74,689 queued URLs (99.97%)
+# were this one path, 18+ hours and 2,620 pages visited found zero new
+# documents, all of it spent here instead of on real content.
+#
+# Third confirmed case, different shape but same outcome: KSEB's
+# kseb.in/downloads/<token> and kseb.in/sbudownloads/<token> look like
+# per-document file links (an opaque encrypted token per URL, linked from
+# nearly every page's nav), but directly tested 37 different FRESH tokens
+# pulled live off the homepage -- every one of them just re-serves KSEB's
+# own homepage/nav shell (confirmed by content, not just status code: same
+# ~155 nav links every time), never an actual file. Cross-checked against
+# KSEB's own already-discovered documents: 2,412 of 2,431 (99.2%) already
+# come from the normal, extension-matched kseb.in/uploads/ path -- these
+# two patterns are not hiding real content, they're dead ends on the site's
+# own side. Queuing them as pages anyway grew one crawl's queue to 354,460
+# entries and crashed it outright (see save_checkpoint()'s MemoryError fix,
+# same incident) for zero net documents.
+UTILITY_URL_PATH_PATTERNS = ("/styleswitcher/", "/freport/complaint.php", "/downloads/", "/sbudownloads/")
+
+
+def is_utility_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return any(pattern in path for pattern in UTILITY_URL_PATH_PATTERNS)
+
+
 def is_pagination_link(abs_url: str, link_text: str) -> bool:
     return bool(PAGINATION_TEXT_RE.match(link_text or "") or PAGINATION_URL_RE.search(abs_url))
+
+
+def _is_skippable_href(href: str) -> bool:
+    """True for hrefs that are never worth resolving at all: mail/phone/JS
+    links, and a bare '#' (no fragment to even evaluate). A non-empty
+    fragment ('#section2', '#/pages/...', '#annual-reports') is NOT
+    decided here anymore -- whether it's a genuine same-page anchor or a
+    distinct virtual route depends on the page's own content, which only
+    _resolve_fragment_url() (below) has access to."""
+    if not href or href.startswith(("mailto:", "tel:", "javascript:")):
+        return True
+    return href == "#"
+
+
+def _resolve_fragment_url(soup: BeautifulSoup, base_url: str, href: str) -> str:
+    """Resolves href to an absolute URL, deciding whether to keep or strip
+    a '#fragment' based on whether THIS PAGE actually has a matching
+    id=/name= anchor -- not just the fragment's shape.
+
+    A fragment starting with '/' is always kept (delegated to
+    normalize_url(), unchanged) -- confirmed real case: AVVNL is an
+    Angular SPA whose entire site lives behind '#/...' routes off one
+    real URL; stripping those collapsed every distinct page into the
+    homepage.
+
+    A fragment that does NOT start with '/' but ALSO matches no id=/name=
+    anywhere on this page is kept too -- confirmed real, different case:
+    TGSOUTHERNPOWER's nav links to '#annual-reports', '#quarterly-reports'
+    etc., but no id="annual-reports" (or similar) exists anywhere in the
+    page -- a JS click-handler must swap in that section's real content,
+    so stripping the fragment would wrongly collapse these into the
+    homepage the same way AVVNL's did. A fragment that DOES match a real
+    id=/name= on this page is a genuine same-page anchor (someone linking
+    to '#section2' where <div id="section2"> truly exists) and is
+    stripped as before -- same URL as the page itself, correctly not a
+    new page to queue."""
+    resolved = urljoin(base_url, href)
+    fragment = urlparse(resolved).fragment
+    if fragment and not fragment.startswith("/"):
+        target_exists = soup.find(id=fragment) is not None or soup.find("a", attrs={"name": fragment}) is not None
+        if not target_exists:
+            return resolved
+    return normalize_url(resolved)
 
 
 def extract_links(html: str, base_url: str) -> list[tuple[str, str]]:
@@ -398,10 +629,10 @@ def extract_links(html: str, base_url: str) -> list[tuple[str, str]]:
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        if not href or href.startswith(("mailto:", "tel:", "javascript:", "#")):
+        if _is_skippable_href(href):
             continue
         try:
-            abs_url = normalize_url(urljoin(base_url, href))
+            abs_url = _resolve_fragment_url(soup, base_url, href)
         except ValueError:
             # Malformed href on the SOURCE page (bad markup) -- confirmed
             # real case: a citation like "[1] https://..." pasted directly
@@ -410,6 +641,36 @@ def extract_links(html: str, base_url: str) -> list[tuple[str, str]]:
             # just this one link rather than crashing the entire crawl.
             continue
         links.append((abs_url, a.get_text(strip=True)))
+    return links
+
+
+def extract_frame_links(html: str, base_url: str) -> list[tuple[str, str]]:
+    """<iframe>/<frame> src attributes, treated as pages to crawl into --
+    confirmed real case: BSPHCL's entire site is an old-school frameset
+    (built with Microsoft FrontPage), where the real navigation and
+    content live in separate pages loaded via iframe src ('Links.htm',
+    'main.htm') -- extract_links() never sees these (it only scans
+    <a href>), and extract_embedded_document_urls() never follows them
+    further either (it only checks whether the iframe's OWN src is
+    itself a document, not whether the page it loads has further links
+    worth crawling). Without this, a frameset site's homepage looks like
+    a dead end with zero real content, even though the real site is
+    sitting one src attribute away. Deliberately only <iframe>/<frame>,
+    not <embed>/<object> -- those two typically embed non-HTML content
+    (a PDF, a video) directly rather than a navigable page."""
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+    for tag in soup.find_all(("iframe", "frame")):
+        src = tag.get("src")
+        if not src:
+            continue
+        try:
+            abs_url = normalize_url(urljoin(base_url, src))
+        except ValueError:
+            # Same malformed-src protection as extract_links() -- see
+            # that function's comment for the confirmed real case.
+            continue
+        links.append((abs_url, tag.get("title") or tag.get("name") or ""))
     return links
 
 
@@ -424,10 +685,10 @@ def extract_nav_links(html: str, base_url: str) -> list[tuple[str, str]]:
     for container in containers:
         for a in container.find_all("a", href=True):
             href = a["href"].strip()
-            if not href or href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            if _is_skippable_href(href):
                 continue
             try:
-                abs_url = normalize_url(urljoin(base_url, href))
+                abs_url = _resolve_fragment_url(soup, base_url, href)
             except ValueError:
                 # Same malformed-href protection as extract_links() -- see
                 # that function's comment for the confirmed real case.
@@ -446,15 +707,43 @@ def _document_url_pattern(extensions=FILE_EXTENSIONS):
     return _DOC_URL_PATTERN_CACHE[key]
 
 
-def extract_embedded_document_urls(html: str, extensions=FILE_EXTENSIONS) -> set[str]:
+def extract_embedded_document_urls(html: str, extensions=FILE_EXTENSIONS, base_url: str | None = None) -> set[str]:
     """Some JS-framework sites (Next.js/Nuxt/etc.) ship document URLs
     inside a JSON blob in the raw HTML for client-side hydration, never as
     a real <a href> — regex-scans the full raw text independent of where
     it sits in the markup. (web-doc-crawler's technique; likely the key to
-    iexindia-style sites per project testing.)"""
+    iexindia-style sites per project testing.)
+
+    Also extracts <iframe src>, <embed src>, and <object data> -- none of
+    which extract_links() ever sees (it only looks at <a href>). The regex
+    scan above already happens to catch an ABSOLUTE-URL iframe/embed/object
+    (it doesn't care what tag a URL sits in), but confirmed real, live case
+    (dgvcl.com's MGT-7 filing): a RELATIVE one -- e.g.
+    <iframe src="usefulpdf/MGT_7_2024-2025.pdf"> -- is invisible to that
+    regex (it requires a literal http(s):// prefix) and was being missed
+    entirely. Only runs when base_url is given (needed to resolve a
+    relative src via urljoin, same as extract_links() already does) --
+    omitting it preserves the exact original regex-only behavior, so no
+    existing caller is affected unless it opts in."""
     if not html:
         return set()
-    return set(_document_url_pattern(extensions).findall(html))
+    found = set(_document_url_pattern(extensions).findall(html))
+    if base_url:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag_name, attr in (("iframe", "src"), ("embed", "src"), ("object", "data")):
+            for tag in soup.find_all(tag_name):
+                src = tag.get(attr)
+                if not src:
+                    continue
+                try:
+                    abs_url = normalize_url(urljoin(base_url, src))
+                except ValueError:
+                    # Same malformed-src protection as extract_links() --
+                    # see that function's comment for the confirmed real case.
+                    continue
+                if is_document_link(abs_url, extensions):
+                    found.add(abs_url)
+    return found
 
 
 def guess_extension_from_content_type(content_type: str) -> str | None:
@@ -479,6 +768,23 @@ def guess_extension_from_content_type(content_type: str) -> str | None:
         "application/vnd.oasis.opendocument.presentation": ".odp",
     }
     return mapping.get((content_type or "").split(";")[0].strip().lower())
+
+
+def guess_extension_from_content_disposition(content_disposition: str) -> str | None:
+    """Pulls the extension off a Content-Disposition header's filename
+    parameter (e.g. 'attachment; filename="report.pdf"') -- a fallback for
+    when Content-Type is missing or useless (confirmed real case: UPJVN
+    sends Content-Type: "text" on every download, but a correct
+    Content-Disposition filename every time). Handles both the plain
+    filename=X and the quoted filename="X" forms; deliberately not
+    handling RFC 5987's filename*=UTF-8''X form -- not seen on any site
+    yet, and a missed extension here just means "treated as an ordinary
+    page" (today's existing fail-safe), not a crash."""
+    match = re.search(r'filename\s*=\s*"?([^";]+)"?', content_disposition or "", re.IGNORECASE)
+    if not match:
+        return None
+    suffix = Path(match.group(1).strip()).suffix.lower()
+    return suffix or None
 
 
 def parse_sitemap_xml(xml_text: str) -> tuple[list[str], bool]:
@@ -506,6 +812,39 @@ def looks_like_spa_shell(content_hashes: list[str], min_pages: int = SPA_SHELL_M
     return (most_common_count / len(content_hashes)) >= dominant_ratio
 
 
+def check_and_refresh_session(fetcher, cfg, url: str, result):
+    """For a site whose server-rendered detail pages depend on ASP.NET
+    session state set by an earlier listing-page visit, and silently fall
+    back to serving that listing page's own content once the session has
+    expired mid-crawl -- no error, no distinguishing status code, just the
+    wrong page. Confirmed real case: SBPDCL's frmTenderDetailsO.aspx --
+    a cold or stale-session fetch returns the generic "Active Tender List"
+    page instead of the real tender (session default-timeout is ~20 min;
+    a long crawl easily outlives it). Re-fetching the listing page in the
+    SAME session re-establishes whatever server-side state the detail page
+    needs, then the detail page is retried once.
+
+    Opt-in per site via a `session_refresh` dict in that site's config
+    (trigger_path_contains, fallback_signature, refresh_url) -- a site
+    without it configured pays zero cost and sees zero behavior change,
+    same as every other per-site opt-in flag in this file."""
+    refresh_cfg = cfg.session_refresh
+    if not refresh_cfg or result.html is None:
+        return result
+    if refresh_cfg.get("trigger_path_contains", "") not in url:
+        return result
+    if refresh_cfg.get("fallback_signature", "") not in result.html:
+        return result
+    refresh_url = refresh_cfg.get("refresh_url")
+    if not refresh_url:
+        return result
+    fetcher.fetch(refresh_url)
+    retried = fetcher.fetch(url)
+    if retried.html is not None and refresh_cfg.get("fallback_signature", "") not in retried.html:
+        return retried
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint / resume (Parikshith's pattern)
 # ---------------------------------------------------------------------------
@@ -518,8 +857,20 @@ def load_checkpoint(path: Path) -> tuple[set, list]:
 
 
 def save_checkpoint(path: Path, visited: set, queue_snapshot: list) -> None:
+    """Streams JSON straight to the file instead of building the whole
+    thing as one string first (json.dumps() + write_text()) -- confirmed
+    real crash on KSEB: its queue grew to 354,460 items (a flood of
+    per-document signed/session-bound download links being queued as
+    ordinary pages -- see notes/ISSUES_LOG.md), and materializing that
+    many objects into one giant JSON string on top of the Python objects
+    already in memory raised a bare MemoryError, killing the crawl.
+    json.dump() writes incrementally and never holds a second full copy
+    of the data as one string, cutting peak memory substantially for a
+    checkpoint this size -- zero behavior or cost change for every
+    normal-sized site."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"visited": list(visited), "queue": queue_snapshot}))
+    with path.open("w", encoding="utf-8") as f:
+        json.dump({"visited": list(visited), "queue": queue_snapshot}, f)
 
 
 # ---------------------------------------------------------------------------
@@ -605,7 +956,8 @@ class SiteFetcher:
 
     def __init__(self, site_tag: str, conn, min_content_length: int = 300,
                  tier1_fetch=None, tier2_bootstrap=None, tier2_fetch=None,
-                 tier3_bootstrap=None, tier3_fetch=None, use_fixed_js_wait: bool = False):
+                 tier3_bootstrap=None, tier3_fetch=None, use_fixed_js_wait: bool = False,
+                 allow_legacy_ssl_renegotiation: bool = False):
         self.site_tag = site_tag
         self.conn = conn
         self.min_content_length = min_content_length
@@ -616,7 +968,36 @@ class SiteFetcher:
         self._tier2_fetch = tier2_fetch or self._real_tier2_fetch
         self._tier3_bootstrap = tier3_bootstrap or self._real_tier3_bootstrap
         self._tier3_fetch = tier3_fetch or self._real_tier3_fetch
-        self._session = build_retry_session()
+        self._session = build_retry_session(allow_legacy_ssl=allow_legacy_ssl_renegotiation)
+        # Automatic, config-free last-resort session for the crawl/discovery
+        # phase -- mirrors the fallback session download_pending_documents()
+        # already builds for the download phase, but that one is a
+        # completely separate object never used here. Confirmed real,
+        # currently-lost case: NRLDC's extensionless document links (e.g.
+        # nrldc.in/download-file?any=...pdf) rely on sniff_content_type()'s
+        # HEAD request to get classified as documents at all; that HEAD
+        # request was going out on a plain session with no legacy-SSL
+        # support and always failing with SSLError, so the link was never
+        # recognized as a document, got queued as an ordinary page instead,
+        # and a real browser then tried to "visit" it and crashed
+        # ("Page.goto: Download is starting") without ever recording the
+        # document. Only tried AFTER the normal session's request already
+        # failed with an SSLError -- a site with no SSL problems never
+        # touches this, zero extra cost.
+        self._fallback_session = build_retry_session(allow_legacy_ssl=True, disable_ssl_verification=True)
+        # Deliberately a PLAIN requests.Session with no Retry adapter mounted
+        # (unlike self._session/self._fallback_session, both built via
+        # build_retry_session() with total=4 retries + backoff) -- used only
+        # for the speculative HTTP-vs-HTTPS probes below. Confirmed real,
+        # serious problem: grid-india.in's plain port 80 doesn't refuse the
+        # connection, it just hangs -- with the normal retry-heavy session,
+        # a short per-attempt timeout still gets multiplied by 4 retries
+        # plus backoff into 20-30+ seconds added to EVERY site's crawl, not
+        # just ones that actually need the HTTP fallback. This session
+        # fails fast, once, with a short timeout (see HTTP_PROBE_TIMEOUT),
+        # so a closed/filtered port 80 costs a few seconds, not tens of
+        # seconds, on a site that never needed this check to begin with.
+        self._quick_probe_session = requests.Session()
         self._tier2_ready = False
         self._tier3_ready = False
         self._tier3_dead = False  # confirmed browser/driver crash, not just a page failure
@@ -624,14 +1005,28 @@ class SiteFetcher:
 
     # -- real implementations (need network / Playwright; not testable here) --
 
-    def _real_tier1_fetch(self, url: str) -> FetchResult:
+    def _real_tier1_fetch(self, url: str, timeout: int = REQUEST_TIMEOUT, session=None) -> FetchResult:
+        session = session or self._session
         try:
             # stream=True + a hard byte cap so one pathologically large page
             # (no pagination on a tag/archive listing, a runaway dynamic
             # page, etc.) can never balloon memory the way a plain
             # session.get() + resp.text did in the confirmed real crash —
             # see MAX_PAGE_RESPONSE_BYTES above.
-            resp = self._session.get(url, timeout=REQUEST_TIMEOUT, stream=True)
+            try:
+                resp = session.get(url, timeout=timeout, stream=True)
+            except requests.exceptions.SSLError:
+                # Automatic, config-free fallback -- same fallback session
+                # already built for downloads and sniff_content_type(), now
+                # also covering the main page fetch itself. Confirmed real
+                # gap: NERC's certificate hostname mismatch failed here
+                # with no retry at all, cascading into a total crawl
+                # failure since Playwright's tiers can't get past a bad
+                # cert either (see ignore_https_errors on both browser
+                # contexts below). Only tried after the normal,
+                # fully-verified request already failed -- a site with no
+                # SSL problems never touches this, zero extra cost.
+                resp = self._fallback_session.get(url, timeout=timeout, stream=True)
             content_length = resp.headers.get("Content-Length")
             if content_length and int(content_length) > MAX_PAGE_RESPONSE_BYTES:
                 resp.close()
@@ -667,7 +1062,8 @@ class SiteFetcher:
         try:
             playwright = sync_playwright().start()
             browser = playwright.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
-            context = browser.new_context(user_agent=USER_AGENT_REAL, viewport={"width": 1920, "height": 1080})
+            context = browser.new_context(user_agent=USER_AGENT_REAL, viewport={"width": 1920, "height": 1080},
+                                           ignore_https_errors=True)
             context.add_init_script(STEALTH_INIT_SCRIPT)
             page = context.new_page()
         except Exception as e:
@@ -700,9 +1096,24 @@ class SiteFetcher:
         return FetchResult(html, page.url, response.status if response else None, 2, None)
 
     def _real_tier2_fetch(self, url: str) -> FetchResult:
-        # Cookies from bootstrap are already in self._session — try that first.
+        # Cookies from bootstrap are already in self._session — try that first,
+        # but only trust it if the page has real links. A plain (non-JS)
+        # fetch of a client-side-routed SPA page always succeeds -- status
+        # 200, real HTML, same bytes every time -- because the server never
+        # even sees the URL's '#/...' fragment; it has no way to return
+        # different content per route. Confirmed real case: AVVNL
+        # (energy.rajasthan.gov.in/avvnl, an Angular hash-router) returned
+        # this exact same content-free loading shell for every one of its
+        # ~150 distinct routes, each accepted here as a "successful" tier-2
+        # fetch and tagged tier_used=2 -- which is exactly what hides this
+        # from crawl_site()'s "tier 1 result with zero links -> verify with
+        # tier 2" safety net below (it only ever checks tier_used == 1, so a
+        # shortcut result wrongly labeled tier 2 slips straight past it).
+        # Checking for a real link here, in the one place that actually
+        # knows this was a plain-fetch shortcut rather than a genuine
+        # render, closes that gap at its source.
         result = self._real_tier1_fetch(url)
-        if result.html is not None:
+        if result.html is not None and extract_links(result.html, result.final_url):
             return FetchResult(result.html, result.final_url, result.status_code, 2, None)
         # Escalate this one page to the already-open stealth browser.
         _, _, context, page = self._playwright_handles[2]
@@ -721,7 +1132,7 @@ class SiteFetcher:
         try:
             playwright = sync_playwright().start()
             browser = playwright.chromium.launch(headless=False)
-            context = browser.new_context(user_agent=USER_AGENT_REAL)
+            context = browser.new_context(user_agent=USER_AGENT_REAL, ignore_https_errors=True)
             page = context.new_page()
         except Exception as e:
             # Same launch-failure cleanup as tier 2's bootstrap — no handle
@@ -798,22 +1209,41 @@ class SiteFetcher:
 
     # -- escalation state machine (this part IS fully unit-testable via injected fakes) --
 
-    def sniff_content_type(self, url: str, timeout: int = 10) -> str | None:
-        """HEAD-requests a URL to check its real Content-Type without
-        downloading the body — for a link with no file extension at all
-        that might still be a real document. Confirmed real need from
-        GERC: /viewdocument/<opaque-token> URLs serve real files but have
-        no recognizable extension, so is_document_link() alone can never
-        catch them — they were being queued as ordinary pages, and a real
-        browser trying to "visit" one instead started a file download,
-        crashing that page with "Download is starting" and never
-        recording the document. Fails safe: any network error or timeout
-        just means "treat this as an ordinary page," exactly matching
-        today's existing behavior — a site with no extension-less links
-        at all sees zero behavior change and pays zero extra cost."""
+    def sniff_content_type(self, url: str, timeout: int = 10) -> tuple[str, str] | None:
+        """HEAD-requests a URL to check its real Content-Type (and
+        Content-Disposition) without downloading the body — for a link
+        with no file extension at all that might still be a real
+        document. Confirmed real need from GERC: /viewdocument/<opaque-token>
+        URLs serve real files but have no recognizable extension, so
+        is_document_link() alone can never catch them — they were being
+        queued as ordinary pages, and a real browser trying to "visit" one
+        instead started a file download, crashing that page with
+        "Download is starting" and never recording the document.
+
+        Also returns Content-Disposition -- confirmed real, separate gap
+        from UPJVN: its server sends Content-Type: "text" (not a real
+        MIME type, so guess_extension_from_content_type() can't map it)
+        on every download, but ALSO sends a perfectly good
+        Content-Disposition: attachment; filename="X.pdf" every time.
+        Relying on Content-Type alone meant every one of these documents
+        was wrongly treated as an ordinary page, hitting the exact same
+        "Download is starting" crash as the GERC case above despite the
+        HEAD request itself succeeding.
+
+        Returns None only when the HEAD request itself fails outright
+        (network error/timeout) -- "treat this as an ordinary page,"
+        exactly matching today's existing behavior. A site with no
+        extension-less links at all sees zero behavior change and pays
+        zero extra cost."""
         try:
             resp = self._session.head(url, timeout=timeout, allow_redirects=True)
-            return resp.headers.get("Content-Type", "")
+            return resp.headers.get("Content-Type", ""), resp.headers.get("Content-Disposition", "")
+        except requests.exceptions.SSLError:
+            try:
+                resp = self._fallback_session.head(url, timeout=timeout, allow_redirects=True)
+                return resp.headers.get("Content-Type", ""), resp.headers.get("Content-Disposition", "")
+            except Exception:
+                return None
         except Exception:
             return None
 
@@ -824,11 +1254,18 @@ class SiteFetcher:
         — no behavior change there. When True (used only for the initial
         site-probing fetch), a page must ALSO contain at least
         MIN_MEANINGFUL_LINKS_FOR_SEED_PAGE real links to count as
-        successful — see the constant's docstring for why."""
+        successful — see the constant's docstring for why.
+
+        Counts extract_frame_links() alongside extract_links() -- confirmed
+        real case: BSPHCL's homepage is an old-style frameset with zero
+        <a href> links at all (its real nav lives inside an iframe src),
+        so every tier's seed probe failed this check and the site was
+        wrongly declared completely unreachable before extract_frame_links()
+        even got a chance to find the real content one level in."""
         if result.html is None:
             return False, result.error or "no content"
         if require_content:
-            link_count = len(extract_links(result.html, url))
+            link_count = len(extract_links(result.html, url)) + len(extract_frame_links(result.html, url))
             if link_count < MIN_MEANINGFUL_LINKS_FOR_SEED_PAGE:
                 return False, (f"page loaded ({len(result.html)} bytes) but contained only "
                                 f"{link_count} link(s) — likely a JavaScript-rendered shell "
@@ -840,6 +1277,28 @@ class SiteFetcher:
             result = self._tier1_fetch(url)
             ok, reason = self._evaluate_fetch(result, url, require_content)
             if ok:
+                if require_content:
+                    # Confirmed real cases in BOTH directions: NERC's HTTPS
+                    # vhost is misconfigured and returns a broken
+                    # hosting-error page with just barely enough links (1)
+                    # to pass the deliberately lenient
+                    # MIN_MEANINGFUL_LINKS_FOR_SEED_PAGE check above -- so it
+                    # never fails, never escalates, and never reaches the
+                    # last-resort protocol-swap at the bottom of this
+                    # method. TERC's server times out on plain HTTP
+                    # entirely while HTTPS works fine -- the opposite
+                    # direction. This is a SEPARATE, narrower check that
+                    # only ever runs once per site (require_content is only
+                    # True for the initial seed probe): if the other
+                    # protocol's version of the exact same URL has MORE
+                    # real links, it's almost certainly the real site while
+                    # the configured one is broken, so prefer it. A
+                    # genuinely fine seed (the overwhelming majority) just
+                    # costs one extra cheap tier-1-only fetch and keeps its
+                    # own result unchanged.
+                    better = self._try_better_http_seed(url, result)
+                    if better is not None:
+                        return better
                 return result
             self._log_escalation(url, 1, reason, "stealth-headless")
             self.active_tier = 2
@@ -874,6 +1333,9 @@ class SiteFetcher:
             if ok:
                 storage.log_breaker(self.conn, self.site_tag, url, "headed", "n/a", "n/a", "succeeded (final tier)")
                 return boot
+            downgraded = self._try_http_downgrade(url, require_content)
+            if downgraded is not None:
+                return downgraded
             storage.log_breaker(self.conn, self.site_tag, url, "headed", reason,
                                  "no further tier available", "still failed")
             return FetchResult(None, boot.final_url, boot.status_code, 3, reason)
@@ -881,10 +1343,99 @@ class SiteFetcher:
         result = self._tier3_fetch(url)
         ok, reason = self._evaluate_fetch(result, url, require_content)
         if not ok:
+            downgraded = self._try_http_downgrade(url, require_content)
+            if downgraded is not None:
+                return downgraded
             storage.log_breaker(self.conn, self.site_tag, url, "headed", reason,
                                  "no further tier available", "still failed")
             return FetchResult(None, result.final_url, result.status_code, 3, reason)
         return result
+
+    @staticmethod
+    def _swap_protocol(url: str) -> str | None:
+        """Returns the same URL with its scheme flipped (https<->http), or
+        None if it's neither. Both directions are real, confirmed cases --
+        NERC needs https->http (a broken HTTPS vhost serving the wrong
+        content), TERC needs the opposite, http->https (the server has
+        stopped accepting plain-HTTP connections at all, timing out on
+        port 80, while HTTPS on 443 works perfectly). There's no way to
+        know in advance which direction a future site will need, so both
+        checks below try whichever protocol ISN'T the one that just
+        failed."""
+        if url.startswith("https://"):
+            return "http://" + url[len("https://"):]
+        if url.startswith("http://"):
+            return "https://" + url[len("http://"):]
+        return None
+
+    def _try_http_downgrade(self, url: str, require_content: bool) -> FetchResult | None:
+        """Last-resort recovery, tried only once every tier (1, 2, AND 3) has
+        already failed for this URL over its configured protocol. Confirmed
+        real, currently active cases in both directions (see
+        _swap_protocol()'s docstring): NERC's HTTPS virtual host is
+        misconfigured on shared hosting and serves a completely different,
+        broken page (a CloudAccess.net hosting-error stub) than plain HTTP
+        does for the exact same URL -- no exception is ever raised (it's a
+        normal 200 response, just wrong content), so this can't be caught
+        the way the SSL-certificate fallback catches a raised SSLError.
+        TERC's server times out connecting on port 80 entirely (confirmed
+        live) while HTTPS works fine -- the opposite direction, same
+        underlying idea. Deliberately placed only at the two
+        already-exhausted-every-tier exit points, not as an eager first
+        choice: a working site never reaches this code at all (zero cost,
+        zero risk of ever weakening a site that already works), and a
+        genuinely dead site (nothing at either protocol) still correctly
+        fails afterward since this goes through the exact same
+        _evaluate_fetch() check as every other tier -- a swap that returns
+        equally useless content is rejected, not blindly trusted just
+        because it responded. Config-free: works for every existing and
+        future site with no per-site flag to set or forget."""
+        swapped_url = self._swap_protocol(url)
+        if swapped_url is None:
+            return None
+        result = self._real_tier1_fetch(swapped_url, timeout=HTTP_PROBE_TIMEOUT, session=self._quick_probe_session)
+        ok, _ = self._evaluate_fetch(result, swapped_url, require_content)
+        if not ok:
+            return None
+        storage.log_breaker(self.conn, self.site_tag, url, "n/a",
+                             "original protocol unusable at every tier",
+                             f"recovered via {swapped_url}", "succeeded (final tier)")
+        return result
+
+    def _try_better_http_seed(self, seed_url: str, seed_result: FetchResult) -> FetchResult | None:
+        """Narrower companion to _try_http_downgrade() above, for the one
+        case that check can never reach: a seed that returns REAL
+        (non-empty, correctly-typed) content and so never fails
+        _evaluate_fetch() or escalates tiers at all, but that content is
+        wrong -- confirmed real case: NERC's broken HTTPS vhost returns a
+        hosting-error page with exactly 1 link, just barely enough to pass
+        MIN_MEANINGFUL_LINKS_FOR_SEED_PAGE's deliberately lenient threshold
+        (see its own docstring for why that threshold can't simply be
+        raised). Only ever called once per site (require_content is True
+        only for the initial seed probe), and uses the same short-timeout,
+        no-retry quick-probe session as _try_http_downgrade() -- confirmed
+        real, serious problem: grid-india.in's plain port 80 doesn't refuse
+        the connection, it just hangs, so this must fail fast rather than
+        adding tens of seconds to every single site's crawl regardless of
+        whether it ever needed this check. Compares real link counts
+        rather than trying to detect "this looks like an error page" -- a
+        fragile, provider-specific heuristic -- so it only ever swaps in
+        the other protocol's version when it is DEMONSTRABLY richer in
+        real content, never on a guess."""
+        swapped_url = self._swap_protocol(seed_url)
+        if swapped_url is None:
+            return None
+        swapped_result = self._real_tier1_fetch(swapped_url, timeout=HTTP_PROBE_TIMEOUT, session=self._quick_probe_session)
+        if not swapped_result.html:
+            return None
+        seed_links = len(extract_links(seed_result.html, seed_result.final_url))
+        swapped_links = len(extract_links(swapped_result.html, swapped_result.final_url))
+        if swapped_links <= seed_links:
+            return None
+        storage.log_breaker(self.conn, self.site_tag, seed_url, "n/a",
+                             f"seed has only {seed_links} link(s), {swapped_url} has {swapped_links}",
+                             f"switched to {swapped_url}", "succeeded (final tier)")
+        return swapped_result
 
     def verify_empty_page_with_tier2(self, url: str) -> FetchResult:
         """Independent, per-page safety net -- deliberately NOT part of the
@@ -909,8 +1460,17 @@ class SiteFetcher:
         at tier 2, not tier 3 -- tier 3 launches a real, visible browser
         window and is a rare, deliberate last resort, not something to
         trigger automatically and silently on every empty-looking page
-        across every site."""
-        if not self._tier2_ready:
+        across every site.
+
+        Checks for the handle itself, not just _tier2_ready -- confirmed
+        real crash on JBVNL: once a site fully escalates past tier 2 to
+        tier 3, _close_tier_handle(2) closes AND REMOVES that handle, but
+        never resets _tier2_ready back to False. This safety net is
+        independent of active_tier and can still fire after that
+        escalation (a later tier-1 page with zero links) -- seeing
+        _tier2_ready still True, it skipped re-launching a browser and
+        indexed a handle that no longer existed: KeyError: 2."""
+        if 2 not in self._playwright_handles:
             result = self._tier2_bootstrap(url)
             self._tier2_ready = True
             return result
@@ -928,8 +1488,9 @@ class SiteFetcher:
         playwright, browser, _context, _page = handle
         try:
             browser.close()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [warning] tier {tier} browser.close() failed during cleanup for "
+                  f"{self.site_tag}: {e}")
         try:
             playwright.stop()
         except Exception:
@@ -948,10 +1509,28 @@ def discover_sitemap_urls(fetcher: SiteFetcher, base_url: str, max_sub_sitemaps:
     """Fetches /sitemap.xml, recursing into a sitemap_index.xml if that's
     what's found instead. Best-effort — a missing or unusable sitemap
     yields an empty list, never an error (additive input, not a
-    requirement; see project plan)."""
+    requirement; see project plan).
+
+    Deliberately uses fetcher._tier1_fetch() directly instead of
+    fetcher.fetch() -- confirmed real, reproducible crash: JERCJKL's
+    /sitemap.xml doesn't exist, and the server's own error handling
+    redirects that ONE request to a completely dead domain alias
+    (jercjkl.nic.in, doesn't resolve in DNS at all). Going through the
+    normal fetch() escalates the site's STICKY active_tier from 1 all the
+    way to 3 over a sitemap lookup nobody needs, and left the tier-3
+    browser's page in a broken navigation state that then made the very
+    next real fetch -- the actual homepage -- fail too
+    ("interrupted by another navigation to chrome-error://chromewebdata"),
+    producing a total 0-page crawl failure on a site that's perfectly
+    reachable at tier 1. A sitemap is either a plain static XML file or it
+    isn't -- there's no legitimate case where it needs a JS-rendering
+    browser to appear -- so this never escalates tiers or touches
+    Playwright at all; any failure here is just treated as "no sitemap,"
+    exactly the existing degraded-but-fine outcome, without being able to
+    poison the real crawl on the way there."""
     parsed = urlparse(base_url)
     sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
-    result = fetcher.fetch(sitemap_url)
+    result = fetcher._tier1_fetch(sitemap_url)
     if not result.html:
         return []
 
@@ -961,7 +1540,7 @@ def discover_sitemap_urls(fetcher: SiteFetcher, base_url: str, max_sub_sitemaps:
 
     all_urls = []
     for sub_sitemap_url in urls[:max_sub_sitemaps]:
-        sub_result = fetcher.fetch(sub_sitemap_url)
+        sub_result = fetcher._tier1_fetch(sub_sitemap_url)
         if sub_result.html:
             sub_urls, _ = parse_sitemap_xml(sub_result.html)
             all_urls.extend(sub_urls)
@@ -969,17 +1548,49 @@ def discover_sitemap_urls(fetcher: SiteFetcher, base_url: str, max_sub_sitemaps:
 
 
 def gather_auto_seeds(fetcher: SiteFetcher, base_url: str, extensions=FILE_EXTENSIONS,
-                       keyword_rules=None) -> tuple[list[tuple[str, str, str]], list[str]]:
+                       keyword_rules=None) -> tuple[list[tuple[str, str, str]], list[str], str]:
     """Combines nav-menu links (current site structure) with sitemap.xml
     (often more complete, catches archived sections no longer in nav).
-    Returns (classified_seeds, direct_document_urls) — sitemap entries that
-    are ALREADY a target file extension skip seeding entirely and go
-    straight to document discovery."""
+    Returns (classified_seeds, direct_document_urls, homepage_final_url) —
+    sitemap entries that are ALREADY a target file extension skip seeding
+    entirely and go straight to document discovery. homepage_final_url is
+    normally just base_url unchanged, EXCEPT when the homepage fetch itself
+    resolved somewhere else -- confirmed real, currently-relevant case:
+    NERC's HTTPS vhost is broken but plain HTTP works
+    (SiteFetcher._try_better_http_seed), so this fetch already transparently
+    swapped to http://nerc.org.in/. Returning that here lets the caller
+    queue the URL that's ACTUALLY known to work, instead of re-queuing the
+    original (broken) base_url and re-triggering the exact same problem the
+    very next time it's fetched -- confirmed real bug: without this, the
+    swap only ever helped this one throwaway probe fetch, never the real
+    crawl."""
     homepage = fetcher.fetch(base_url, require_content=True)
     nav_candidates = extract_nav_links(homepage.html, base_url) if homepage.html else []
+    if not nav_candidates and homepage.html:
+        # extract_nav_links() only looks inside <nav>/role="navigation"
+        # containers -- confirmed real gap: NERC's real menu markup is
+        # old-style (plain <div><ul><li><a>, no semantic wrapper at all),
+        # so nav-specific extraction finds nothing even on a perfectly
+        # real, correctly-fetched homepage. Falling back to every link on
+        # the page only when nav-specific extraction found LITERALLY
+        # NOTHING -- a site with real <nav> markup is completely
+        # unaffected, since it never reaches this branch.
+        nav_candidates = extract_links(homepage.html, homepage.final_url)
+
+    # Confirmed real bug: HVPN's homepage (an Angular SPA with no <nav>
+    # markup, triggering the fallback above) links directly to 7 real PDF
+    # tenders/notices right on the homepage -- e.g.
+    # hvpn.org.in:8443/profile/....pdf. Without this filter, every one of
+    # those got merged into `seeds` below (pages to CRAWL) instead of
+    # being recorded as documents, exactly like the sitemap path a few
+    # lines below already correctly does for its own candidates. Routed
+    # into the SAME direct_documents list/recording path as sitemap finds,
+    # rather than adding a second, separate mechanism.
+    nav_direct_documents = [url for url, _text in nav_candidates if is_document_link(url, extensions)]
+    nav_candidates = [(url, text) for url, text in nav_candidates if not is_document_link(url, extensions)]
 
     sitemap_urls = discover_sitemap_urls(fetcher, base_url)
-    direct_documents = [u for u in sitemap_urls if is_document_link(u, extensions)]
+    direct_documents = nav_direct_documents + [u for u in sitemap_urls if is_document_link(u, extensions)]
     sitemap_page_candidates = [(u, "") for u in sitemap_urls if not is_document_link(u, extensions)]
 
     merged = {url: text for url, text in nav_candidates}
@@ -989,7 +1600,7 @@ def gather_auto_seeds(fetcher: SiteFetcher, base_url: str, extensions=FILE_EXTEN
 
     classified = classify.classify_seed_candidates(list(merged.items()), keyword_rules)
     seeds = [(url, cat, sub) for url, cat, sub, _matched in classified]
-    return seeds, direct_documents
+    return seeds, direct_documents, homepage.final_url
 
 
 # ---------------------------------------------------------------------------
@@ -1007,7 +1618,7 @@ class CrawlStats:
 
 def crawl_site(cfg: SiteConfig, conn, fetcher: SiteFetcher, resume: bool = False) -> CrawlStats:
     stats = CrawlStats()
-    rp = load_robots(cfg.seeds[0][0]) if cfg.seeds else None
+    rp = load_robots(cfg.seeds[0][0], conn, cfg.site_tag) if cfg.seeds else None
     keyword_rules = cfg.keyword_rules
     start_time = time.monotonic()
 
@@ -1021,13 +1632,24 @@ def crawl_site(cfg: SiteConfig, conn, fetcher: SiteFetcher, resume: bool = False
             base_url = cfg.seeds[0][0]
             print(f"  Scanning homepage nav menu + sitemap.xml for auto-seeds...")
             tier_before_seeding = fetcher.active_tier
-            auto_seeds, direct_docs = gather_auto_seeds(fetcher, base_url, keyword_rules=keyword_rules)
+            auto_seeds, direct_docs, homepage_final_url = gather_auto_seeds(fetcher, base_url, keyword_rules=keyword_rules)
             if tier_before_seeding != fetcher.active_tier:
                 print(f"  [tier escalation] {cfg.site_tag} moved from tier {tier_before_seeding} "
                       f"to tier {fetcher.active_tier} while probing the homepage")
+            if homepage_final_url != base_url:
+                # Confirmed real bug otherwise: gather_auto_seeds()'s own
+                # probe fetch can transparently recover a broken seed (e.g.
+                # NERC's HTTPS->HTTP swap), but re-queuing the ORIGINAL
+                # base_url here would just re-trigger the exact same
+                # problem the moment the main loop below fetches it as an
+                # ordinary page (that swap only ever applies to the
+                # one-time seed probe, never an ordinary fetch). Queue the
+                # URL that's actually known to work instead.
+                print(f"  [seed corrected] {base_url} -> {homepage_final_url}")
+            first_seed = [homepage_final_url, cfg.seeds[0][1], cfg.seeds[0][2]]
             print(f"  Found {len(auto_seeds)} auto-classified seed(s), "
                   f"{len(direct_docs)} document(s) directly in sitemap.xml.")
-            all_seeds = list(cfg.seeds) + [[u, c, s] for u, c, s in auto_seeds]
+            all_seeds = [first_seed] + list(cfg.seeds[1:]) + [[u, c, s] for u, c, s in auto_seeds]
             for url, cat, sub in all_seeds:
                 queue.append((url, 0, cat, sub))
             for doc_url in direct_docs:
@@ -1048,7 +1670,18 @@ def crawl_site(cfg: SiteConfig, conn, fetcher: SiteFetcher, resume: bool = False
             break
 
         url, depth, cat_hint, sub_hint = queue.popleft()
-        if url in visited or urlparse(url).netloc not in cfg.allowed_domains:
+        url_netloc = urlparse(url).netloc
+        if (url in visited or is_same_base_domain(url_netloc, cfg.excluded_domains)
+                or not (url_netloc in cfg.allowed_domains
+                        or is_same_base_domain(url_netloc, cfg.allowed_domains))):
+            # Re-checked here (not just at enqueue time) specifically so
+            # excluded_domains also applies retroactively to a URL already
+            # sitting in an OLD checkpoint's queue from before that
+            # exclusion existed -- confirmed real need: karnatakagov's
+            # checkpoint already has thousands of BESCOM/HESCOM/GESCOM/
+            # MESCOM/CESC-Mysore URLs queued from before excluded_domains
+            # was added. Resuming (not --fresh) skips them here instead of
+            # needing to discard the checkpoint and lose real progress.
             continue
         if not is_allowed_by_robots(rp, url):
             if cfg.respect_robots:
@@ -1057,8 +1690,13 @@ def crawl_site(cfg: SiteConfig, conn, fetcher: SiteFetcher, resume: bool = False
                 print(f"  [robots-blocked] {url}")
                 continue
             else:
-                storage.log_breaker(conn, cfg.site_tag, url, "n/a", "robots.txt block (ignored by default)",
-                                     "fetched anyway", "logged for awareness only")
+                # Not logged to BREAKERS_LOG -- this fires on nearly every
+                # page of most sites (confirmed: 30,947 of 34,194 total
+                # breaker rows, 91%, were this single line, drowning out
+                # the rows that actually matter) and robots.txt is
+                # deliberately not enforced by default anyway, so there is
+                # nothing here to act on. Still counted for the
+                # run-summary line below.
                 robots_would_have_blocked_count += 1
 
         visited.add(url)
@@ -1069,6 +1707,28 @@ def crawl_site(cfg: SiteConfig, conn, fetcher: SiteFetcher, resume: bool = False
         if result.html is None:
             print(f"  [skip] fetch failed for {url} ({result.error or 'no content'})")
             continue
+
+        refreshed = check_and_refresh_session(fetcher, cfg, url, result)
+        if refreshed is not result:
+            print(f"  [session refreshed] {url} looked like a stale-session fallback page, re-fetched after refresh")
+            storage.log_breaker(conn, cfg.site_tag, url, "n/a",
+                                 "stale-session fallback page detected", "refreshed listing page and retried",
+                                 "succeeded")
+            result = refreshed
+
+        if cfg.postback_documents:
+            # Site-specific, opt-in only -- see sbpdcl_postback_discovery.py.
+            # Must run here, immediately after this exact page fetch, since
+            # the ASP.NET viewstate tokens it needs are tied to this one
+            # render and can't be replayed from a later, separate download
+            # phase.
+            import sbpdcl_postback_discovery
+            new_postback_docs = sbpdcl_postback_discovery.discover_and_download(
+                conn, cfg, fetcher._session, result.final_url, result.html, FILE_EXTENSIONS)
+            if new_postback_docs:
+                stats.documents_found += new_postback_docs
+                stats.documents_new += new_postback_docs
+                print(f"  [postback] {new_postback_docs} document(s) recovered from {url}")
 
         links = extract_links(result.html, result.final_url)
         # Per-page JS-shell safety net: a tier-1 result with zero real
@@ -1089,6 +1749,16 @@ def crawl_site(cfg: SiteConfig, conn, fetcher: SiteFetcher, resume: bool = False
                 result = verified
                 links = verified_links
 
+        # Added after the JS-shell safety net above (deliberately) -- that
+        # check is specifically about <a href> links going missing on a
+        # client-rendered page, and frame links are a different, unrelated
+        # signal that shouldn't affect it either way. See
+        # extract_frame_links()'s docstring for the confirmed real case
+        # (BSPHCL) this covers: an old-style frameset site whose real
+        # navigation and content live inside iframe/frame src pages, never
+        # reachable through this page's own <a href> links at all.
+        links = links + extract_frame_links(result.html, result.final_url)
+
         stats.pages_visited += 1
         elapsed_min = (time.monotonic() - start_time) / 60
         print(f"  [{stats.pages_visited}] ({elapsed_min:.1f} min elapsed, {len(queue)} queued, "
@@ -1098,41 +1768,143 @@ def crawl_site(cfg: SiteConfig, conn, fetcher: SiteFetcher, resume: bool = False
 
         leaf = is_leaf_url(url)
         suppressed_link_count = 0
-        for embedded_url in extract_embedded_document_urls(result.html):
+        for embedded_url in extract_embedded_document_urls(result.html, base_url=result.final_url):
             _record_document_if_new(conn, cfg, stats, embedded_url, url, cat_hint, sub_hint, "", keyword_rules)
 
         for link_url, link_text in links:
             if is_document_link(link_url):
-                # Document recording can optionally ignore the domain
+                # Document recording never applies the same domain
                 # restriction that page-following always respects — a real
                 # ministry site commonly links to files hosted on a shared
-                # government asset/CDN server it doesn't otherwise control.
-                # cfg.domain_blind_documents defaults to False, in which
-                # case this is IDENTICAL to the original single domain
-                # check (False or X == X) — zero behavior change for any
-                # site that doesn't explicitly opt in. Confirmed from
-                # multisite's own source: it recorded file hits with NO
-                # domain check at all, only restricting page-following.
-                if cfg.domain_blind_documents or urlparse(link_url).netloc in cfg.allowed_domains:
+                # government asset/CDN server it doesn't otherwise control
+                # (GRID-INDIA's webcdn.grid-india.in, ERCKERALA's
+                # dev.erckerala.org). is_same_base_domain() always trusts a
+                # same-site subdomain regardless of domain_blind_documents;
+                # that flag only extends trust further, to a domain that
+                # isn't even a subdomain of this site's own domain -- an
+                # explicit opt-in for the rarer, more security-sensitive
+                # case (see is_same_base_domain()'s docstring).
+                netloc = urlparse(link_url).netloc
+                if (not is_same_base_domain(netloc, cfg.excluded_domains)
+                        and (netloc in cfg.allowed_domains or is_same_base_domain(netloc, cfg.allowed_domains)
+                             or cfg.domain_blind_documents)):
                     _record_document_if_new(conn, cfg, stats, link_url, url, cat_hint, sub_hint, link_text, keyword_rules)
                 continue
-            if not Path(urlparse(link_url).path).suffix:
-                # No extension at all in the path -- worth a quick HEAD
-                # check before assuming this is just an ordinary page.
-                # Cached per-run so the same extension-less URL, if linked
+            path_suffix = Path(urlparse(link_url).path).suffix.lower()
+            is_bare_domain_root = urlparse(link_url).path in ("", "/")
+            is_truly_extensionless = path_suffix == "" and not is_bare_domain_root
+            # Narrower than "any non-asset extension" (confirmed too broad
+            # below) -- only an ambiguous extension on a path that actually
+            # looks like a file-serving handler is worth sniffing.
+            is_suspected_document_handler = (
+                path_suffix not in ("", *SKIP_EXTENSIONS)
+                and any(kw in link_url.lower() for kw in DOCUMENT_HANDLER_PATH_KEYWORDS)
+            )
+            if is_truly_extensionless or is_suspected_document_handler:
+                # Bare-root exclusion confirmed real, distinct case: a hub
+                # site like karnataka.gov.in or saubhagya.gov.in links out
+                # to dozens/hundreds of OTHER departments' own sites, each
+                # as a plain https://example.gov.in with no path at all --
+                # 77 of 128 sniff attempts on one karnataka.gov.in crawl
+                # were exactly this, each one a slow, failing HEAD request
+                # (many of these smaller government sites are themselves
+                # slow/unreliable) spent confirming something already known
+                # with near-certainty: nobody serves a downloadable file at
+                # a site's bare root with zero path, that's always a
+                # homepage. Costs nothing on a site that doesn't link out
+                # this way, same as the SKIP_EXTENSIONS check above.
+                #
+                # is_suspected_document_handler confirmed real, distinct
+                # case from the plain extensionless one this check used to
+                # require: SSNNL serves real documents at
+                # download.aspx?couchdbdocid=<id> (confirmed via HEAD:
+                # Content-Disposition: attachment;filename=...pdf). ".aspx"
+                # IS a non-empty suffix, so the original "if not suffix"
+                # check skipped the sniff entirely before it ever got a
+                # chance to see that header -- 103 real documents on one
+                # crawl fell straight through to being queued as ordinary
+                # pages instead, each one crashing with "Download is
+                # starting" the way the original GERC case did. The FIRST
+                # fix for this broadened the trigger to "any extension that
+                # isn't a known asset type" -- confirmed too broad in turn:
+                # TGERC's homepage alone has 41 ordinary .php navigation
+                # links (Archive.php, currentyearorders.php, ...), each now
+                # paying a needless HEAD request before being allowed
+                # through as a page, adding real, compounding overhead
+                # across a whole crawl and starving it of time to ever
+                # reach those pages' own hundreds of real documents.
+                # DOCUMENT_HANDLER_PATH_KEYWORDS narrows this back down to
+                # only a path that actually looks like a file-serving
+                # handler (download.aspx, getfile.php, ...), not every
+                # ordinary .php/.aspx page a traditional government site is
+                # built from. Cached per-run so the same URL, if linked
                 # from many pages, is only ever sniffed once -- and a URL
                 # already confirmed as a document must still be treated as
                 # one on every later encounter, not just the first.
                 if link_url not in sniffed_urls:
-                    content_type = fetcher.sniff_content_type(link_url)
-                    sniffed_urls[link_url] = bool(content_type and guess_extension_from_content_type(content_type))
+                    sniffed = fetcher.sniff_content_type(link_url)
+                    if sniffed is None:
+                        # Both the normal AND fallback HEAD requests failed
+                        # outright (network error, not just "not a
+                        # document") -- silently treated as "not a
+                        # document" before this fix, exactly the class of
+                        # gap the NRLDC bug was. Now traceable instead of
+                        # invisible if it happens again on a future site.
+                        storage.log_breaker(conn, cfg.site_tag, link_url, "n/a",
+                                             "extensionless link could not be sniffed (HEAD request failed)",
+                                             "treated as an ordinary page, not a document",
+                                             "flagged for manual review")
+                        content_type, content_disposition = "", ""
+                    else:
+                        content_type, content_disposition = sniffed
+                    # Content-Type is checked first since it's the more
+                    # standard signal; Content-Disposition's filename is
+                    # the fallback for a server that sends a real
+                    # attachment but a useless/missing Content-Type (see
+                    # sniff_content_type()'s docstring -- UPJVN).
+                    extension = (guess_extension_from_content_type(content_type)
+                                 or guess_extension_from_content_disposition(content_disposition))
+                    sniffed_urls[link_url] = bool(extension)
                 if sniffed_urls[link_url]:
-                    if cfg.domain_blind_documents or urlparse(link_url).netloc in cfg.allowed_domains:
+                    netloc = urlparse(link_url).netloc
+                    if (not is_same_base_domain(netloc, cfg.excluded_domains)
+                            and (netloc in cfg.allowed_domains or is_same_base_domain(netloc, cfg.allowed_domains)
+                                 or cfg.domain_blind_documents)):
                         _record_document_if_new(conn, cfg, stats, link_url, url, cat_hint, sub_hint, link_text, keyword_rules)
                     continue
-            if urlparse(link_url).netloc not in cfg.allowed_domains:
+            link_netloc = urlparse(link_url).netloc
+            if is_same_base_domain(link_netloc, cfg.excluded_domains):
+                # Opt-in per site via excluded_domains in that site's config
+                # -- confirmed real need: karnataka.gov.in links out to 365+
+                # other department/agency subdomains, several of which
+                # (the electricity DISCOMs: BESCOM, HESCOM, GESCOM, MESCOM,
+                # CESC Mysore) are already being crawled as their own
+                # separate, dedicated sites. Without this, karnataka.gov.in's
+                # crawl would wastefully re-crawl all of them a second time.
+                # Checked before allowed_domains below so an exclusion always
+                # wins even if the domain would otherwise be in scope.
+                continue
+            if not (link_netloc in cfg.allowed_domains or is_same_base_domain(link_netloc, cfg.allowed_domains)):
+                # Page-following used to be stricter than document
+                # recording: is_same_base_domain() already automatically
+                # trusted a document link on the same site's own subdomain
+                # (see its docstring), but this exact-match-only check
+                # still refused to ever CRAWL INTO one -- confirmed real,
+                # recurring case: ERLDC's actual "Reports" section is
+                # entirely hosted on report.erldc.in, a subdomain of
+                # erldc.in that was never followed, same pattern as
+                # GRID-INDIA's webcdn and ERCKERALA's dev subdomain. This
+                # was the exact "notice it site by site" gap the user
+                # explicitly rejected -- extending the SAME already-tested,
+                # already-safe same-base-domain check (still correctly
+                # excludes a genuinely unrelated domain, e.g. ERLDC's
+                # fc.posoco.in, a different organization entirely) to
+                # page-following closes it for every site automatically,
+                # not just document recording.
                 continue
             if should_skip_asset(link_url):
+                continue
+            if is_utility_url(link_url):
                 continue
             if link_url in visited:
                 continue
@@ -1180,8 +1952,26 @@ def crawl_site(cfg: SiteConfig, conn, fetcher: SiteFetcher, resume: bool = False
               f"crawling — reconsider whether respect_robots should be on for this site.")
     if robots_would_have_blocked_count > 0:
         print(f"  [info] {robots_would_have_blocked_count} URL(s) were technically disallowed by "
-              f"robots.txt but fetched anyway (robots.txt is not enforced by default) — see "
-              f"BREAKERS_LOG.xlsx if you want to review which ones.")
+              f"robots.txt but fetched anyway (robots.txt is not enforced by default). Not logged "
+              f"individually to BREAKERS_LOG.xlsx — enable respect_robots for this site if you want "
+              f"these actually blocked instead.")
+
+    CRAWL_BASICALLY_FAILED_PAGE_THRESHOLD = 3
+    if (not resume and len(cfg.seeds) > 1
+            and stats.pages_visited < CRAWL_BASICALLY_FAILED_PAGE_THRESHOLD
+            and stats.documents_found == 0):
+        # Nothing currently flags a site whose crawl died almost
+        # immediately (seed unreachable, whole site down from the start)
+        # short of eyeballing MASTER_SUMMARY.xlsx after the fact. Guarded
+        # against resumed runs (a near-finished checkpoint legitimately
+        # visits few NEW pages) and single-seed sites (a deliberately tiny
+        # real site shouldn't false-positive) -- requires BOTH almost no
+        # pages AND zero documents found, not page count alone.
+        print(f"  [warning] {cfg.site_tag} visited only {stats.pages_visited} page(s) and found "
+              f"0 documents this run — this crawl likely failed almost immediately. Flagged as a breaker.")
+        storage.log_breaker(conn, cfg.site_tag, cfg.seeds[0][0] if cfg.seeds else "", "n/a",
+                             f"crawl visited only {stats.pages_visited} page(s), found 0 documents",
+                             "site may be unreachable or seeds broken", "flagged for manual review")
 
     if looks_like_spa_shell(stats.content_hashes):
         print(f"  [warning] {cfg.site_tag} looks like a single-page-app shell — "
@@ -1234,6 +2024,8 @@ def _record_document_if_new(conn, cfg: SiteConfig, stats: CrawlStats, doc_url: s
         doc_url, link_text, found_on, cfg.folder_map,
     )
     new_filename = storage.disambiguate_filename(conn, new_filename, doc_url, cfg.site_tag)
+    new_filename = enforce_filename_component_limit(new_filename)
+    target_folder_path = enforce_folder_component_limit(target_folder_path)
     if verification_note:
         date_basis_note = f"{date_basis_note}; {verification_note}"
 
@@ -1288,6 +2080,38 @@ def _windows_long_path(path: Path) -> Path:
     return Path(prefixed_str) if prefixed_str != resolved_str else path
 
 
+def bucket_download_error(exc: Exception) -> str:
+    """Collapses a download failure's exception text into a short, scannable
+    category for BREAKERS_LOG.xlsx -- the same bucketing worked out by hand
+    during the DB error analysis (crawler.db's documents.download_error is
+    already one-off per-URL text; the breaker log should stay scannable
+    across sites instead of repeating that)."""
+    msg = str(exc)
+    if "CERTIFICATE_VERIFY_FAILED" in msg:
+        return "SSL cert verify failed"
+    if "UNSAFE_LEGACY_RENEGOTIATION" in msg:
+        return "SSL legacy renegotiation"
+    if "forcibly closed" in msg or "ConnectionResetError" in msg or "Connection aborted" in msg:
+        return "connection reset by remote host"
+    if "Read timed out" in msg or isinstance(exc, requests.exceptions.ReadTimeout):
+        return "read timeout"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "connect timeout"
+    if "NameResolutionError" in msg or "getaddrinfo failed" in msg:
+        return "DNS resolution failed"
+    if "sign-in page" in msg:
+        return "redirected to login page"
+    if isinstance(exc, requests.exceptions.HTTPError):
+        return f"HTTP error ({msg[-40:]})"
+    if "empty response body" in msg:
+        return "empty response body"
+    if "WinError 123" in msg or "Errno 22" in msg:
+        return "Windows path/filename syntax error"
+    if "Max retries exceeded" in msg:
+        return "max retries exceeded (other)"
+    return msg[:80]
+
+
 def download_one(db_path: str, cfg: SiteConfig, doc: dict, session: requests.Session, run_start_time: float,
                   fallback_session: requests.Session | None = None) -> tuple[bool, str | None]:
     """Runs inside a worker thread — opens its OWN SQLite connection rather
@@ -1297,6 +2121,7 @@ def download_one(db_path: str, cfg: SiteConfig, doc: dict, session: requests.Ses
     conn = storage.get_connection(db_path)
     local_path = cfg.output_dir / doc["target_folder_path"] / doc["new_filename"]
     elapsed_min = (time.monotonic() - run_start_time) / 60
+    retry_used = None  # set to a short label when a fallback/retry branch below fires
     try:
         safe_path = _windows_long_path(local_path)
         safe_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1313,6 +2138,7 @@ def download_one(db_path: str, cfg: SiteConfig, doc: dict, session: requests.Ses
             # AFTER the normal, fully-verified session's request has
             # already failed with an SSLError -- a site with no SSL
             # problems never touches this, zero extra cost.
+            retry_used = "SSL fallback session"
             response_cm = fallback_session.get(doc["doc_url"], timeout=30, stream=True)
         except requests.exceptions.Timeout:
             # Same automatic, config-free philosophy as the SSL fallback
@@ -1323,7 +2149,42 @@ def download_one(db_path: str, cfg: SiteConfig, doc: dict, session: requests.Ses
             # future site will be similarly slow. Retried once with a
             # longer timeout on the SAME session -- a site that responds
             # within 30s never pays this extra cost.
+            retry_used = f"extended {EXTENDED_DOWNLOAD_TIMEOUT}s timeout"
             response_cm = session.get(doc["doc_url"], timeout=EXTENDED_DOWNLOAD_TIMEOUT, stream=True)
+        except requests.exceptions.ConnectionError:
+            # A third confirmed real problem, distinct from both above:
+            # WBSETCL resets the underlying TCP connection mid-request
+            # ("Connection aborted... forcibly closed by the remote host")
+            # on 70 documents, with zero SSL or timeout involvement -- a
+            # transient server-side hiccup that a fresh connection (a
+            # different session, same as the SSL fallback) typically
+            # survives. Retried once; if the fallback session also fails,
+            # this falls through to the same except Exception handling
+            # below as before -- no change to how a genuine failure is
+            # recorded.
+            if fallback_session is None:
+                raise
+            retry_used = "fresh connection (fallback session)"
+            response_cm = fallback_session.get(doc["doc_url"], timeout=30, stream=True)
+        if response_cm.status_code == 429:
+            # A fourth confirmed real problem, distinct from the three
+            # above: some file-serving subdomains (e.g. ERCKERALA's
+            # dev.erckerala.org, confirmed ~84% 429 rate) rate-limit
+            # aggressively. Unlike SSL/connection-reset, a fresh session
+            # identity doesn't help here -- 429 means "slow down", not
+            # "try a different connection" -- so this waits (honoring the
+            # server's own Retry-After header when given) and retries once
+            # on the SAME session. A site that never gets rate-limited
+            # never pays this cost.
+            retry_after = response_cm.headers.get("Retry-After")
+            try:
+                wait_seconds = float(retry_after) if retry_after else 5.0
+            except ValueError:
+                wait_seconds = 5.0
+            response_cm.close()
+            time.sleep(wait_seconds)
+            retry_used = retry_used or f"429 backoff ({wait_seconds:.0f}s wait)"
+            response_cm = session.get(doc["doc_url"], timeout=30, stream=True)
         with response_cm as resp:
             if any(marker in resp.url.lower() for marker in ("/signin", "/login", "/auth")):
                 raise PermissionError(
@@ -1334,13 +2195,32 @@ def download_one(db_path: str, cfg: SiteConfig, doc: dict, session: requests.Ses
             content = resp.content
         if not content:
             raise ValueError("empty response body")
+        expected_ext = Path(doc["new_filename"]).suffix
+        if not is_valid_file_content(content, expected_ext):
+            raise ValueError(
+                f"downloaded content doesn't look like a real {expected_ext} file "
+                f"(got {len(content)} bytes starting with {content[:8]!r} — likely an "
+                f"HTML wrapper/viewer page instead of the actual file, e.g. a "
+                f"viewpdf.php-style URL that claims to be a document but isn't one)"
+            )
         safe_path.write_bytes(content)
         sha256 = hashlib.sha256(content).hexdigest()
         storage.mark_downloaded(conn, doc["doc_url"], True, None, str(local_path), sha256)
         print(f"    [downloaded] ({elapsed_min:.1f} min elapsed) {doc['new_filename']}")
+        if retry_used:
+            # Visibility into how often this site actually needs the
+            # automatic fallback -- previously invisible inside a plain
+            # [downloaded] console line, with no way to tell "worked first
+            # try" from "only worked after retrying" without re-reading
+            # terminal scrollback.
+            storage.log_breaker(conn, cfg.site_tag, doc["doc_url"], "download",
+                                 "n/a", f"retried via {retry_used}", "succeeded (final tier)")
         return True, None
     except Exception as e:
         storage.mark_downloaded(conn, doc["doc_url"], False, str(e), None)
+        action_taken = f"retried via {retry_used}, still failed" if retry_used else "no retry available for this error type"
+        storage.log_breaker(conn, cfg.site_tag, doc["doc_url"], "download",
+                             bucket_download_error(e), action_taken, "still failed")
         print(f"    [failed] ({elapsed_min:.1f} min elapsed) {doc['new_filename']}: {e}")
         return False, str(e)
     finally:
@@ -1369,7 +2249,14 @@ def download_pending_documents(conn, cfg: SiteConfig, db_path: str, run_start_ti
         return 0, 0
 
     print(f"  Downloading {len(docs)} pending document(s), {cfg.download_concurrency} at a time...")
-    session = build_retry_session(allow_legacy_ssl=cfg.allow_legacy_ssl_renegotiation)
+    # disable_ssl_verification is opt-in per site (unlike the automatic
+    # fallback below) -- for a site CONFIRMED to always need it (e.g. HVPN's
+    # hvpn.org.in:8443 has an invalid cert on every single request), this
+    # skips paying for a doomed fully-verified attempt on every download
+    # before falling back; a site with no known SSL problem leaves this
+    # false and pays nothing extra.
+    session = build_retry_session(allow_legacy_ssl=cfg.allow_legacy_ssl_renegotiation,
+                                   disable_ssl_verification=cfg.disable_ssl_verification)
     # A single relaxed session, built once per run, used ONLY as an
     # automatic last-resort retry when the normal session's request fails
     # with an SSLError -- see download_one()'s comment. verify=False skips
@@ -1385,15 +2272,30 @@ def download_pending_documents(conn, cfg: SiteConfig, db_path: str, run_start_ti
         futures = {executor.submit(download_one, db_path, cfg, doc, session, run_start_time, fallback_session): doc
                    for doc in docs}
         for future in as_completed(futures):
+            doc = futures[future]
             try:
                 success, _ = future.result()
                 downloaded += success
                 failed += not success
+                if not success and (doc.get("download_attempts") or 0) + 1 >= storage.MAX_DOWNLOAD_ATTEMPTS:
+                    # The moment a document crosses the retry ceiling, not
+                    # every attempt leading up to it -- previously only a
+                    # console count of exhausted documents, no queryable
+                    # record of WHICH ones short of manually reading the
+                    # per-site workbook.
+                    storage.log_breaker(conn, cfg.site_tag, doc["doc_url"], "download",
+                                         f"exhausted all {storage.MAX_DOWNLOAD_ATTEMPTS} retry attempts",
+                                         "will no longer be auto-retried", "flagged for manual review")
             except Exception as e:
                 # An unexpected crash for one document (e.g. its own DB
                 # connection failed to open) must not stop the rest of the
-                # batch from being attempted and counted.
-                print(f"  [warning] unexpected error downloading {futures[future]['doc_url']}: {e}")
+                # batch from being attempted and counted. Previously
+                # print()-only -- the document silently stayed
+                # "not downloaded" with zero trace of why anywhere durable.
+                storage.mark_downloaded(conn, doc["doc_url"], False, str(e), None)
+                storage.log_breaker(conn, cfg.site_tag, doc["doc_url"], "download",
+                                     f"unexpected worker error: {e}", "n/a", "still failed")
+                print(f"  [warning] unexpected error downloading {doc['doc_url']}: {e}")
                 failed += 1
     print(f"  Downloads complete: {downloaded} succeeded, {failed} failed.")
     return downloaded, failed
@@ -1417,22 +2319,30 @@ def run_one_site(cfg: SiteConfig, mode: str, db_path: str, fresh: bool = False) 
 
     previous_shas = storage.get_all_shas(conn, cfg.site_tag)
 
+    crawl_duration_seconds = None
+    download_duration_seconds = None
+
     if mode == "download-only":
         print("  --mode download-only: skipping the crawl entirely — downloading whatever "
               "documents are already known in the database from a previous inventory/download run.")
         stats = CrawlStats()
     else:
-        fetcher = SiteFetcher(cfg.site_tag, conn, use_fixed_js_wait=cfg.use_fixed_js_wait)
+        crawl_start = time.monotonic()
+        fetcher = SiteFetcher(cfg.site_tag, conn, use_fixed_js_wait=cfg.use_fixed_js_wait,
+                               allow_legacy_ssl_renegotiation=cfg.allow_legacy_ssl_renegotiation)
         try:
             stats = crawl_site(cfg, conn, fetcher, resume=cfg.checkpoint_path.exists())
         finally:
             fetcher.close()
+        crawl_duration_seconds = time.monotonic() - crawl_start
 
     try:
         downloaded = failed = 0
         change_log = []
         if mode in ("download", "download-only"):
+            download_start = time.monotonic()
             downloaded, failed = download_pending_documents(conn, cfg, db_path, run_start_time)
+            download_duration_seconds = time.monotonic() - download_start
             current_shas = storage.get_all_shas(conn, cfg.site_tag)
             change_log = storage.diff_shas(previous_shas, current_shas)
 
@@ -1459,6 +2369,8 @@ def run_one_site(cfg: SiteConfig, mode: str, db_path: str, fresh: bool = False) 
             conn, cfg.site_tag, cfg.seeds[0][0] if cfg.seeds else "", mode, started_at,
             stats.pages_visited, stats.documents_found, stats.documents_new, stats.documents_known,
             downloaded, failed, type_counts,
+            crawl_duration_seconds=crawl_duration_seconds,
+            download_duration_seconds=download_duration_seconds,
         )
 
         workbook_path = storage.export_site_workbook(conn, cfg.site_tag, change_log,

@@ -102,7 +102,9 @@ BREAKERS_LOG_COLUMNS = [
 MASTER_ROLLUP_COLUMNS = [
     "Site", "Pages Crawled (last run)", "Total Files Known",
     "PDF", "DOC", "DOCX", "XLS", "XLSX", "CSV", "Other File Types",
-    "Downloaded", "Failed", "Pending", "First Run At", "Last Run At",
+    "Downloaded", "Failed", "Pending",
+    "Crawl Time (min, last run)", "Download Time (min, last run)",
+    "First Run At", "Last Run At",
 ]
 
 
@@ -197,7 +199,9 @@ def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
             documents_new        INTEGER NOT NULL,
             documents_known      INTEGER NOT NULL,
             downloaded_count     INTEGER NOT NULL,
-            failed_download_count INTEGER NOT NULL
+            failed_download_count INTEGER NOT NULL,
+            crawl_duration_seconds    REAL,
+            download_duration_seconds REAL
         );
 
         CREATE TABLE IF NOT EXISTS run_file_type_counts (
@@ -228,6 +232,8 @@ def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     )
     _ensure_column(conn, "documents", "naming_scheme", "TEXT")
     _ensure_column(conn, "documents", "download_attempts", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "runs", "crawl_duration_seconds", "REAL")
+    _ensure_column(conn, "runs", "download_duration_seconds", "REAL")
     conn.commit()
     return conn
 
@@ -459,17 +465,21 @@ def get_failed_documents(conn: sqlite3.Connection, site_tag: str) -> list[dict]:
 def record_run(conn: sqlite3.Connection, site_tag: str, start_url: str, mode: str,
                 started_at: str, pages_visited: int, documents_found: int,
                 documents_new: int, documents_known: int, downloaded_count: int,
-                failed_download_count: int, file_type_counts: dict) -> int:
+                failed_download_count: int, file_type_counts: dict,
+                crawl_duration_seconds: float | None = None,
+                download_duration_seconds: float | None = None) -> int:
     cursor = conn.execute(
         """
         INSERT INTO runs (
             site_tag, start_url, mode, started_at, pages_visited,
             documents_found, documents_new, documents_known,
-            downloaded_count, failed_download_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            downloaded_count, failed_download_count,
+            crawl_duration_seconds, download_duration_seconds
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (site_tag, start_url, mode, started_at, pages_visited, documents_found,
-         documents_new, documents_known, downloaded_count, failed_download_count),
+         documents_new, documents_known, downloaded_count, failed_download_count,
+         crawl_duration_seconds, download_duration_seconds),
     )
     run_id = cursor.lastrowid
     for file_type, count in file_type_counts.items():
@@ -656,6 +666,8 @@ def export_site_workbook(conn: sqlite3.Connection, site_tag: str,
         wb.save(output_path)
     except Exception as e:
         print(f"  [warning] could not save {output_path} — is it open in another program? ({e})")
+        log_breaker(conn, site_tag, str(output_path), "n/a", f"workbook save failed: {e}",
+                    "site's document data unchanged in DB, only this export skipped", "n/a")
     return output_path
 
 
@@ -730,6 +742,12 @@ def _compute_master_row(conn: sqlite3.Connection, site_tag: str) -> list:
     ).fetchone()[0]
     pending = total - downloaded - failed
 
+    def _minutes(seconds) -> str | int:
+        return round(seconds / 60, 1) if seconds is not None else ""
+
+    crawl_minutes = _minutes(latest_run["crawl_duration_seconds"]) if latest_run else ""
+    download_minutes = _minutes(latest_run["download_duration_seconds"]) if latest_run else ""
+
     return _sanitize_row([
         site_tag,
         latest_run["pages_visited"] if latest_run else 0,
@@ -739,6 +757,7 @@ def _compute_master_row(conn: sqlite3.Connection, site_tag: str) -> list:
         type_counts.get("xlsx", 0), type_counts.get("csv", 0),
         other_types,
         downloaded, failed, pending,
+        crawl_minutes, download_minutes,
         first_run["started_at"] if first_run else "",
         latest_run["finished_at"] if latest_run else "",
     ])
@@ -764,6 +783,8 @@ def export_master_rollup(conn: sqlite3.Connection, site_tags: list[str],
         wb.save(output_path)
     except Exception as e:
         print(f"  [warning] could not save {output_path} — is it open in another program? ({e})")
+        log_breaker(conn, "ALL", str(output_path), "n/a", f"workbook save failed: {e}",
+                    "master rollup snapshot for this run was not written", "n/a")
     return output_path
 
 
@@ -831,6 +852,9 @@ def update_master_summary(conn: sqlite3.Connection, site_tag: str,
                 wb.save(output_path)
             except Exception as e:
                 print(f"  [warning] could not save {output_path} — is it open in another program? ({e})")
+                log_breaker(conn, site_tag, str(output_path), "n/a", f"workbook save failed: {e}",
+                            "this site's row was updated in memory but not persisted to MASTER_SUMMARY.xlsx",
+                            "n/a")
             return output_path
         finally:
             _release_cross_process_lock(lock_path)
@@ -869,6 +893,13 @@ def export_breakers_log(conn: sqlite3.Connection, output_path: str | Path = "BRE
                 wb.save(output_path)
             except Exception as e:
                 print(f"  [warning] could not save {output_path} — is it open in another program? ({e})")
+                # Can't log this INTO the file that just failed to save --
+                # written to the breakers table anyway (that write still
+                # succeeds even though this run's Excel export didn't), so
+                # it surfaces on the next successful export instead of
+                # being lost to terminal scrollback.
+                log_breaker(conn, "ALL", str(output_path), "n/a", f"workbook save failed: {e}",
+                            "breakers log Excel export skipped this run, data still in DB", "n/a")
             return output_path
         finally:
             _release_cross_process_lock(lock_path)

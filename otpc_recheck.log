@@ -1,0 +1,74 @@
+  Scanning homepage nav menu + sitemap.xml for auto-seeds...
+  [seed corrected] https://otpcindia.in -> https://otpcindia.in/
+  Found 28 auto-classified seed(s), 1 document(s) directly in sitemap.xml.
+  Starting crawl with 29 seed page(s) queued...
+  [1] (0.0 min elapsed, 28 queued, 1 docs so far) https://otpcindia.in/
+  [2] (5.1 min elapsed, 155 queued, 1 docs so far) https://otpcindia.in/about-us/about-otpc/
+  [3] (5.2 min elapsed, 263 queued, 1 docs so far) https://otpcindia.in/investor/
+  [4] (5.2 min elapsed, 361 queued, 5 docs so far) https://otpcindia.in/investor/otpc-shareholders/
+  [5] (5.2 min elapsed, 455 queued, 5 docs so far) https://otpcindia.in/archive-notices/
+  [6] (5.2 min elapsed, 547 queued, 5 docs so far) https://otpcindia.in/about-us/otpc-board-of-directors/
+  [7] (5.2 min elapsed, 638 queued, 8 docs so far) https://otpcindia.in/about-us/mds-message/
+  [8] (5.3 min elapsed, 727 queued, 8 docs so far) https://otpcindia.in/about-us/awards-accolades/
+  [9] (5.3 min elapsed, 814 queued, 8 docs so far) https://otpcindia.in/our-business/
+  [10] (5.3 min elapsed, 893 queued, 8 docs so far) https://otpcindia.in/our-business/project-genesis/
+  [11] (5.3 min elapsed, 966 queued, 8 docs so far) https://otpcindia.in/our-business/plant-details/
+  [12] (5.4 min elapsed, 1029 queued, 8 docs so far) https://otpcindia.in/our-business/plant-details/safety-environment/
+  [13] (5.4 min elapsed, 1086 queued, 11 docs so far) https://otpcindia.in/statutory-compliance-policies/compliance-reports/
+  [14] (5.4 min elapsed, 1143 queued, 33 docs so far) https://otpcindia.in/our-business/plant-details/location/
+  [15] (5.4 min elapsed, 1193 queued, 33 docs so far) https://otpcindia.in/our-business/power-saving-calculator/
+  [16] (5.4 min elapsed, 1241 queued, 33 docs so far) https://otpcindia.in/statutory-compliance-policies/
+  [17] (5.5 min elapsed, 1287 queued, 33 docs so far) https://otpcindia.in/statutory-compliance-policies/policies/
+  [18] (5.5 min elapsed, 1335 queued, 42 docs so far) https://otpcindia.in/statutory-compliance-policies/csr-policy/
+  [19] (5.5 min elapsed, 1377 queued, 42 docs so far) https://otpcindia.in/statutory-compliance-policies/csr-policy/csr-compositions/
+  [20] (5.5 min elapsed, 1419 queued, 42 docs so far) https://otpcindia.in/statutory-compliance-policies/csr-policy/csr-projects/
+  (checkpoint saved at 20 pages)
+  [21] (5.6 min elapsed, 1458 queued, 50 docs so far) https://otpcindia.in/comm/
+  [22] (6.0 min elapsed, 1487 queued, 52 docs so far) https://otpcindia.in/comm/information-on-fuel/
+  [23] (6.0 min elapsed, 1514 queued, 56 docs so far) https://otpcindia.in/procurement/
+  [24] (6.0 min elapsed, 1539 queued, 56 docs so far) https://otpcindia.in/procurement/vendor-registration/
+  [25] (6.1 min elapsed, 1561 queued, 56 docs so far) https://otpcindia.in/procurement/tenders-floated/
+  [26] (6.1 min elapsed, 1581 queued, 56 docs so far) https://otpcindia.in/procurement/archived-tenders/
+  [27] (6.1 min elapsed, 1599 queued, 268 docs so far) https://otpcindia.in/important-links/
+C:\Users\REC-DELL-72\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\connectionpool.py:1110: InsecureRequestWarning: Unverified HTTPS request is being made to host 'recindia.nic.in'. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+C:\Users\REC-DELL-72\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\connectionpool.py:1110: InsecureRequestWarning: Unverified HTTPS request is being made to host 'gercin.org'. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+C:\Users\REC-DELL-72\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\connectionpool.py:1110: InsecureRequestWarning: Unverified HTTPS request is being made to host 'www.dgvcl.com'. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+C:\Users\REC-DELL-72\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\connectionpool.py:1110: InsecureRequestWarning: Unverified HTTPS request is being made to host 'dgvcl.com'. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+C:\Users\REC-DELL-72\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\connectionpool.py:1110: InsecureRequestWarning: Unverified HTTPS request is being made to host 'www.pgvcl.com'. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+C:\Users\REC-DELL-72\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\connectionpool.py:1110: InsecureRequestWarning: Unverified HTTPS request is being made to host 'www.noidapower.com'. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+C:\Users\REC-DELL-72\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\connectionpool.py:1110: InsecureRequestWarning: Unverified HTTPS request is being made to host 'www.nescoodisha.com'. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+C:\Users\REC-DELL-72\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\connectionpool.py:1110: InsecureRequestWarning: Unverified HTTPS request is being made to host 'pas77-situs.pages.dev'. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+C:\Users\REC-DELL-72\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\connectionpool.py:1110: InsecureRequestWarning: Unverified HTTPS request is being made to host 'thecalvertbaltimore.com'. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+  [28] (56.9 min elapsed, 1615 queued, 268 docs so far) https://otpcindia.in/notices-recruitment/
+C:\Users\REC-DELL-72\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\urllib3\connectionpool.py:1110: InsecureRequestWarning: Unverified HTTPS request is being made to host 'www.naukri.com'. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+  [29] (57.3 min elapsed, 1629 queued, 270 docs so far) https://otpcindia.in/events/
+  [30] (57.3 min elapsed, 1642 queued, 270 docs so far) https://otpcindia.in/otpc-offices/
+  [31] (57.4 min elapsed, 1652 queued, 270 docs so far) https://webmail.otpcindia.in/owa
+  [32] (57.4 min elapsed, 1594 queued, 270 docs so far) https://otpcindia.in/news-events/
+  [33] (57.5 min elapsed, 1602 queued, 270 docs so far) https://otpcindia.in/announcements/
+  [34] (57.5 min elapsed, 1600 queued, 270 docs so far) https://otpcindia.in/terms-of-use/
+  [35] (57.5 min elapsed, 1606 queued, 270 docs so far) https://otpcindia.in/privacy-policy/
+  [36] (57.5 min elapsed, 1610 queued, 270 docs so far) https://otpcindia.in/disclaimer/
+  [37] (57.5 min elapsed, 1612 queued, 270 docs so far) https://otpcindia.in/sitemap/
+  [38] (57.6 min elapsed, 1518 queued, 270 docs so far) https://otpcindia.in
+  [39] (57.6 min elapsed, 1517 queued, 270 docs so far) https://otpcindia.in/about-us/
+  [40] (57.6 min elapsed, 597 queued, 270 docs so far) https://otpcindia.in/csr-activities/
+  (checkpoint saved at 40 pages)
+  [41] (57.7 min elapsed, 397 queued, 270 docs so far) https://otpcindia.in/statutory-pdf/hr-policy/
+  [42] (57.7 min elapsed, 91 queued, 270 docs so far) https://www.otpcindia.in/important-links
+  [43] (57.7 min elapsed, 3 queued, 270 docs so far) https://otpcindia.in/business-detail/
+  [44] (57.7 min elapsed, 1 queued, 270 docs so far) https://otpcindia.in/news-letters/
+  [45] (57.8 min elapsed, 0 queued, 270 docs so far) https://otpcindia.in/page-not-found/
+  Crawl finished: 45 page(s) visited this run. 270 unique document(s) newly recorded. (418 more encounter(s) were the SAME document found again via a different link — either earlier in this run, e.g. a file linked from multiple pages, or from a previous run if the database wasn't reset — not 418 additional distinct documents.)
+
+RESULT pages_visited: 45 | documents_found: 270
